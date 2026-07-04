@@ -196,14 +196,16 @@ fn packed_keccak_witness_matches_scalar_keccak() {
         }
     }
 
-    let protocol = ProtocolState::new_keccak(&initial);
-    assert_eq!(protocol.witness.round_state(0), &initial);
+    let mut protocol = ProtocolState::new();
+    protocol.witness.input_mut().copy_from_slice(&initial);
+    protocol.generate_keccak();
+    assert_eq!(protocol.witness.input(), &initial);
 
     for state in &mut scalar_states {
         protocol_state::keccak_f_lanes(state);
     }
 
-    let final_state = protocol.witness.final_state();
+    let final_state = protocol.witness.output();
     for instance in 0..protocol_state::PACKED_KECCAKS {
         for y in 0..5 {
             for x in 0..5 {

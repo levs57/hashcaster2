@@ -8,7 +8,6 @@ pub const KECCAK_LANES: usize = 25;
 pub const LANE_BITS: usize = 64;
 pub const KECCAK_BITS: usize = KECCAK_LANES * LANE_BITS;
 pub const KECCAK_ROUNDS: usize = 24;
-pub const KECCAK_STATES: usize = KECCAK_ROUNDS + 1;
 pub const PACKED_MASK: u128 = (1u128 << PACKED_KECCAKS) - 1;
 
 const RHO_OFFSETS: [[u32; 5]; 5] = [
@@ -52,80 +51,89 @@ pub struct ProtocolState {
 }
 
 impl ProtocolState {
-    pub fn new_keccak(initial: &[u128; KECCAK_BITS]) -> Self {
+    pub fn new() -> Self {
         Self {
-            witness: KeccakWitness::generate(initial),
+            witness: KeccakWitness::new(),
             scratches: ReusableScratches::new(),
         }
     }
+
+    pub fn generate_keccak(&mut self) {
+        self.witness.generate(&mut self.scratches);
+    }
 }
 
-#[derive(Default)]
-pub struct ReusableScratches;
+pub struct ReusableScratches {
+    current: Box<[u128]>,
+}
 
 impl ReusableScratches {
     pub fn new() -> Self {
-        Self
+        Self {
+            current: zero_boxed_state(),
+        }
     }
 }
 
 pub struct KeccakWitness {
-    states: Box<[u128]>,
+    input: Box<[u128]>,
+    pre_chi: Box<[u128]>,
+    output: Box<[u128]>,
 }
 
 impl KeccakWitness {
-    pub fn generate(initial: &[u128; KECCAK_BITS]) -> Self {
-        let mut states = vec![0u128; KECCAK_STATES * KECCAK_BITS].into_boxed_slice();
-        states[..KECCAK_BITS].copy_from_slice(initial);
-        for value in &mut states[..KECCAK_BITS] {
+    pub fn new() -> Self {
+        Self {
+            input: zero_boxed_state(),
+            pre_chi: vec![0u128; KECCAK_ROUNDS * KECCAK_BITS].into_boxed_slice(),
+            output: zero_boxed_state(),
+        }
+    }
+
+    pub fn generate(&mut self, scratches: &mut ReusableScratches) {
+        for value in &mut *self.input {
             *value &= PACKED_MASK;
         }
 
-        let mut tmp = [0u128; KECCAK_BITS];
+        scratches.current.copy_from_slice(&self.input);
         for round in 0..KECCAK_ROUNDS {
-            let (prev, next) = split_round_pair(&mut states, round);
-            next.copy_from_slice(prev);
-            keccak_round_packed(next, round, &mut tmp);
+            theta_packed(&mut scratches.current);
+            rho_pi_packed(&scratches.current, self.pre_chi_mut(round));
+            chi_iota_packed(self.pre_chi(round), &mut scratches.current, round);
         }
-
-        Self { states }
+        self.output.copy_from_slice(&scratches.current);
     }
 
     #[inline]
-    pub fn round_state(&self, round: usize) -> &[u128] {
-        assert!(round <= KECCAK_ROUNDS);
-        &self.states[round * KECCAK_BITS..][..KECCAK_BITS]
+    pub fn input(&self) -> &[u128] {
+        &self.input
     }
 
     #[inline]
-    pub fn round_state_mut(&mut self, round: usize) -> &mut [u128] {
-        assert!(round <= KECCAK_ROUNDS);
-        &mut self.states[round * KECCAK_BITS..][..KECCAK_BITS]
+    pub fn input_mut(&mut self) -> &mut [u128] {
+        &mut self.input
     }
 
     #[inline]
-    pub fn bit(&self, round: usize, x: usize, y: usize, z: usize) -> u128 {
-        self.round_state(round)[state_idx(x, y, z)]
+    pub fn pre_chi(&self, round: usize) -> &[u128] {
+        assert!(round < KECCAK_ROUNDS);
+        &self.pre_chi[round * KECCAK_BITS..][..KECCAK_BITS]
     }
 
     #[inline]
-    pub fn final_state(&self) -> &[u128] {
-        self.round_state(KECCAK_ROUNDS)
+    pub fn pre_chi_mut(&mut self, round: usize) -> &mut [u128] {
+        assert!(round < KECCAK_ROUNDS);
+        &mut self.pre_chi[round * KECCAK_BITS..][..KECCAK_BITS]
+    }
+
+    #[inline]
+    pub fn output(&self) -> &[u128] {
+        &self.output
     }
 }
 
-fn split_round_pair(states: &mut [u128], round: usize) -> (&[u128], &mut [u128]) {
-    let prev_start = round * KECCAK_BITS;
-    let next_start = (round + 1) * KECCAK_BITS;
-    let (left, right) = states.split_at_mut(next_start);
-    (&left[prev_start..][..KECCAK_BITS], &mut right[..KECCAK_BITS])
-}
-
-fn keccak_round_packed(state: &mut [u128], round: usize, tmp: &mut [u128; KECCAK_BITS]) {
-    theta_packed(state);
-    rho_pi_packed(state, tmp);
-    chi_packed(state, tmp);
-    iota_packed(state, round);
+fn zero_boxed_state() -> Box<[u128]> {
+    vec![0u128; KECCAK_BITS].into_boxed_slice()
 }
 
 fn theta_packed(state: &mut [u128]) {
@@ -156,39 +164,34 @@ fn theta_packed(state: &mut [u128]) {
     }
 }
 
-fn rho_pi_packed(state: &mut [u128], tmp: &mut [u128; KECCAK_BITS]) {
-    tmp.copy_from_slice(state);
+fn rho_pi_packed(input: &[u128], output: &mut [u128]) {
     for y in 0..5 {
         for x in 0..5 {
             let a = (x + 3 * y) % 5;
             let b = x;
             let r = RHO_OFFSETS[a][b] as usize;
             for z in 0..LANE_BITS {
-                state[state_idx(x, y, z)] = tmp[state_idx(a, b, (z + 64 - r) % 64)];
+                output[state_idx(x, y, z)] = input[state_idx(a, b, (z + 64 - r) % 64)];
             }
         }
     }
 }
 
-fn chi_packed(state: &mut [u128], tmp: &mut [u128; KECCAK_BITS]) {
-    tmp.copy_from_slice(state);
+fn chi_iota_packed(pre_chi: &[u128], output: &mut [u128], round: usize) {
     for y in 0..5 {
         for x in 0..5 {
             for z in 0..LANE_BITS {
-                let a = tmp[state_idx(x, y, z)];
-                let b = tmp[state_idx((x + 1) % 5, y, z)];
-                let c = tmp[state_idx((x + 2) % 5, y, z)];
-                state[state_idx(x, y, z)] = (a ^ ((!b) & c)) & PACKED_MASK;
+                let a = pre_chi[state_idx(x, y, z)];
+                let b = pre_chi[state_idx((x + 1) % 5, y, z)];
+                let c = pre_chi[state_idx((x + 2) % 5, y, z)];
+                output[state_idx(x, y, z)] = (a ^ ((!b) & c)) & PACKED_MASK;
             }
         }
     }
-}
-
-fn iota_packed(state: &mut [u128], round: usize) {
     let rc = ROUND_CONSTANTS[round];
     for z in 0..LANE_BITS {
         if ((rc >> z) & 1) != 0 {
-            state[state_idx(0, 0, z)] ^= PACKED_MASK;
+            output[state_idx(0, 0, z)] ^= PACKED_MASK;
         }
     }
 }
