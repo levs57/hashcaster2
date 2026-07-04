@@ -91,8 +91,8 @@ fn four_russians_96x256_matches_naive() {
 
 #[test]
 fn rmfe_subspace_validates() {
-    assert_eq!(rmfe::validate_rmfe(), Ok(()));
-    let (product, basis, embedding, projection) = rmfe::test_build_subspace().unwrap();
+    rmfe::validate_rmfe();
+    let (product, basis, embedding, projection) = rmfe::test_build_subspace();
     assert_eq!(product.degree(), Some(rmfe::PRODUCT_DEGREE));
     assert!(basis.iter().all(|poly| poly.degree().unwrap() < rmfe::PRODUCT_DEGREE));
     assert_eq!(&embedding, rmfe::embedding_matrix());
@@ -112,7 +112,7 @@ fn rmfe_embedding_matrix_is_linear() {
 
 #[test]
 fn rmfe_embedding_matrix_matches_basis() {
-    let (_, basis, _, _) = rmfe::test_build_subspace().unwrap();
+    let (_, basis, _, _) = rmfe::test_build_subspace();
     for bit in [0usize, 1, 17, 63, 64, 95] {
         assert_eq!(apply_embedding_matrix(1u128 << bit), basis[bit]);
     }
@@ -149,7 +149,7 @@ fn rmfe_embedding_matrix_works_with_effective_kernel() {
 
 #[test]
 fn rmfe_projection_has_multiplicative_friendly_property() {
-    let (_, basis, _, _) = rmfe::test_build_subspace().unwrap();
+    let (_, basis, _, _) = rmfe::test_build_subspace();
     for i in 0..rmfe::RMFE_BITS {
         for j in 0..rmfe::RMFE_BITS {
             let product = boolpoly::clmul_192(basis[i], basis[j]);
