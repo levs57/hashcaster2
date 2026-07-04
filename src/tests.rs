@@ -2,6 +2,7 @@ use crate::boolpoly::{self, BoolPoly};
 use crate::challenger::{Challenger, FsChallenger, ProofReader, ProofTranscript, ProofWriter};
 use crate::field::{self, F128};
 use crate::matrix::{BooleanMatrix, FourRussians128, FourRussians256, PACKED_U64S};
+use crate::protocol_state::{self, ProtocolState};
 use crate::rmfe;
 
 #[test]
@@ -165,6 +166,59 @@ fn boolpoly_clmul_192_matches_naive() {
     let a = BoolPoly::from_limbs([0x1234_5678_9abc_def0, 0x1111_2222_3333_4444, 0x8000_0000_0000_0001, 0]);
     let b = BoolPoly::from_limbs([0xfedc_ba98_7654_3210, 0x5555_aaaa_7777_9999, 0x0000_ffff_0000_ffff, 0]);
     assert_eq!(boolpoly::clmul_192(a, b).limbs(), naive_clmul_192(a, b).limbs());
+}
+
+#[test]
+fn packed_keccak_witness_matches_scalar_keccak() {
+    let mut scalar_states = [[0u64; protocol_state::KECCAK_LANES]; protocol_state::PACKED_KECCAKS];
+    let mut initial = [0u128; protocol_state::KECCAK_BITS];
+
+    let mut rng = 0x1234_5678_9abc_def0_1357_2468_ace0_bdf1u128;
+    for instance in 0..protocol_state::PACKED_KECCAKS {
+        for lane in 0..protocol_state::KECCAK_LANES {
+            rng = rng
+                .wrapping_mul(0xda94_2042_e4dd_58b5_94d0_49bb_1331_11eb)
+                .rotate_left(37);
+            scalar_states[instance][lane] = rng as u64;
+        }
+    }
+
+    for instance in 0..protocol_state::PACKED_KECCAKS {
+        for y in 0..5 {
+            for x in 0..5 {
+                let lane = scalar_states[instance][x + 5 * y];
+                for z in 0..64 {
+                    if ((lane >> z) & 1) != 0 {
+                        initial[protocol_state::state_idx(x, y, z)] |= 1u128 << instance;
+                    }
+                }
+            }
+        }
+    }
+
+    let protocol = ProtocolState::new_keccak(&initial);
+    assert_eq!(protocol.witness.round_state(0), &initial);
+
+    for state in &mut scalar_states {
+        protocol_state::keccak_f_lanes(state);
+    }
+
+    let final_state = protocol.witness.final_state();
+    for instance in 0..protocol_state::PACKED_KECCAKS {
+        for y in 0..5 {
+            for x in 0..5 {
+                let lane = scalar_states[instance][x + 5 * y];
+                for z in 0..64 {
+                    let packed = final_state[protocol_state::state_idx(x, y, z)];
+                    assert_eq!(
+                        ((packed >> instance) & 1) as u64,
+                        (lane >> z) & 1,
+                        "instance {instance}, lane ({x}, {y}), bit {z}",
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn row_mask(seed: u128) -> u128 {
