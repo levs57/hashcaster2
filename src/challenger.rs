@@ -200,11 +200,6 @@ impl<Ch: Challenger> ProofReader<Ch> {
 }
 
 pub trait Challenger {
-    /// Absorb a domain-separation label. Each protocol entry should call this
-    /// once on entry so a transcript from one protocol cannot be replayed as
-    /// another.
-    fn observe_label(&mut self, _label: &[u8]) {}
-
     /// Absorb a single `F128` prover message.
     fn observe_f128(&mut self, value: F128);
 
@@ -238,49 +233,7 @@ pub trait Challenger {
     }
 }
 
-pub trait ChallengeSource {
-    fn draw_f128(&mut self) -> F128;
-
-    fn draw_f128_vec(&mut self, n: usize) -> Vec<F128> {
-        (0..n).map(|_| self.draw_f128()).collect()
-    }
-}
-
-impl<T: Challenger + ?Sized> ChallengeSource for T {
-    fn draw_f128(&mut self) -> F128 {
-        Challenger::sample_f128(self)
-    }
-
-    fn draw_f128_vec(&mut self, n: usize) -> Vec<F128> {
-        Challenger::sample_f128_vec(self, n)
-    }
-}
-
-impl<Ch: Challenger> ChallengeSource for ProofWriter<Ch> {
-    fn draw_f128(&mut self) -> F128 {
-        ProofWriter::sample_f128(self)
-    }
-
-    fn draw_f128_vec(&mut self, n: usize) -> Vec<F128> {
-        ProofWriter::sample_f128_vec(self, n)
-    }
-}
-
-impl<Ch: Challenger> ChallengeSource for ProofReader<Ch> {
-    fn draw_f128(&mut self) -> F128 {
-        ProofReader::sample_f128(self)
-    }
-
-    fn draw_f128_vec(&mut self, n: usize) -> Vec<F128> {
-        ProofReader::sample_f128_vec(self, n)
-    }
-}
-
 impl<T: Challenger + ?Sized> Challenger for &mut T {
-    fn observe_label(&mut self, label: &[u8]) {
-        (**self).observe_label(label);
-    }
-
     fn observe_f128(&mut self, value: F128) {
         (**self).observe_f128(value);
     }
@@ -310,15 +263,6 @@ impl<T: Challenger + ?Sized> Challenger for &mut T {
     }
 }
 
-const OP_DOMAIN: u8 = 0x01;
-const OP_LABEL: u8 = 0x02;
-const OP_OBSERVE: u8 = 0x03;
-const OP_SQUEEZE: u8 = 0x04;
-const OP_BYTES: u8 = 0x05;
-
-const KIND_SCALAR: u8 = 0x01;
-const KIND_SLICE: u8 = 0x02;
-
 /// Global Fiat-Shamir hash counters, enabled with `--features hash-count`.
 #[cfg(feature = "hash-count")]
 pub mod fs_count {
@@ -343,11 +287,9 @@ pub struct FsChallenger {
 }
 
 impl FsChallenger {
-    /// New challenger seeded with a length-prefixed domain-separation tag.
+    /// New challenger seeded with a domain-separation tag.
     pub fn new(domain: &[u8]) -> Self {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&[OP_DOMAIN]);
-        hasher.update(&(domain.len() as u64).to_le_bytes());
         hasher.update(domain);
         Self { hasher }
     }
@@ -364,35 +306,23 @@ impl FsChallenger {
 }
 
 impl Challenger for FsChallenger {
-    fn observe_label(&mut self, label: &[u8]) {
-        self.hasher.update(&[OP_LABEL]);
-        self.hasher.update(&(label.len() as u64).to_le_bytes());
-        self.hasher.update(label);
-    }
-
     fn observe_f128(&mut self, value: F128) {
-        self.hasher.update(&[OP_OBSERVE, KIND_SCALAR]);
         self.absorb_f128(value);
     }
 
     fn observe_f128_slice(&mut self, values: &[F128]) {
-        self.hasher.update(&[OP_OBSERVE, KIND_SLICE]);
-        self.hasher.update(&(values.len() as u64).to_le_bytes());
         for v in values {
             self.absorb_f128(*v);
         }
     }
 
     fn observe_bytes(&mut self, bytes: &[u8]) {
-        self.hasher.update(&[OP_BYTES]);
-        self.hasher.update(&(bytes.len() as u64).to_le_bytes());
         self.hasher.update(bytes);
     }
 
     fn sample_f128(&mut self) -> F128 {
         #[cfg(feature = "hash-count")]
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.hasher.update(&[OP_SQUEEZE, KIND_SCALAR]);
         let snapshot = self.hasher.clone();
         let mut reader = snapshot.finalize_xof();
         let mut buf = [0u8; 16];
@@ -400,21 +330,6 @@ impl Challenger for FsChallenger {
         self.hasher.update(&buf);
         // Interpret 128 Fiat-Shamir bits directly as an `F2^128` element.
         F128::from_raw(u128::from_le_bytes(buf))
-    }
-
-    fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
-        #[cfg(feature = "hash-count")]
-        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.hasher.update(&[OP_SQUEEZE, KIND_SLICE]);
-        self.hasher.update(&(n as u64).to_le_bytes());
-        let snapshot = self.hasher.clone();
-        let mut reader = snapshot.finalize_xof();
-        let mut buf = vec![0u8; n * 16];
-        reader.fill(&mut buf);
-        self.hasher.update(&buf);
-        buf.chunks_exact(16)
-            .map(|chunk| F128::from_raw(u128::from_le_bytes(chunk.try_into().unwrap())))
-            .collect()
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
