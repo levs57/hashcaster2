@@ -14,6 +14,85 @@ pub type FourRussians192 = FourRussiansMatrix<192>;
 pub type FourRussians256 = FourRussiansMatrix<256>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BooleanMatrix<const OUT: usize> {
+    input_len: usize,
+    row_words: Vec<u64>,
+}
+
+impl<const OUT: usize> BooleanMatrix<OUT> {
+    pub fn zero(input_len: usize) -> Self {
+        assert!(input_len > 0);
+        Self {
+            input_len,
+            row_words: vec![0; OUT * input_len.div_ceil(64)],
+        }
+    }
+
+    pub fn from_rows_u128(input_len: usize, rows: &[u128; OUT]) -> Self {
+        assert!(input_len <= u128::BITS as usize);
+        let mut matrix = Self::zero(input_len);
+        for (row_idx, &row) in rows.iter().enumerate() {
+            matrix.row_mut(row_idx)[0] = row as u64;
+            if matrix.words_per_row() > 1 {
+                matrix.row_mut(row_idx)[1] = (row >> 64) as u64;
+            }
+        }
+        matrix
+    }
+
+    #[inline]
+    pub fn input_len(&self) -> usize {
+        self.input_len
+    }
+
+    #[inline]
+    pub fn output_len(&self) -> usize {
+        OUT
+    }
+
+    #[inline]
+    pub fn words_per_row(&self) -> usize {
+        self.input_len.div_ceil(64)
+    }
+
+    #[inline]
+    pub fn row(&self, row: usize) -> &[u64] {
+        let width = self.words_per_row();
+        &self.row_words[row * width..][..width]
+    }
+
+    #[inline]
+    pub fn row_mut(&mut self, row: usize) -> &mut [u64] {
+        let width = self.words_per_row();
+        &mut self.row_words[row * width..][..width]
+    }
+
+    pub fn set(&mut self, row: usize, col: usize) {
+        assert!(row < OUT);
+        assert!(col < self.input_len);
+        self.row_mut(row)[col / 64] |= 1u64 << (col % 64);
+    }
+
+    pub fn get(&self, row: usize, col: usize) -> bool {
+        assert!(row < OUT);
+        assert!(col < self.input_len);
+        ((self.row(row)[col / 64] >> (col % 64)) & 1) != 0
+    }
+
+    fn window(&self, row: usize, group: usize) -> u8 {
+        let bit = group * 8;
+        let row = self.row(row);
+        let word = bit / 64;
+        let shift = bit % 64;
+        let mut value = row[word] >> shift;
+        if shift > 56 && word + 1 < row.len() {
+            value |= row[word + 1] << (64 - shift);
+        }
+        (value & 0xff) as u8
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FourRussiansMatrix<const OUT: usize> {
     input_len: usize,
     windows: Vec<u8>,
@@ -21,34 +100,32 @@ pub struct FourRussiansMatrix<const OUT: usize> {
 
 impl FourRussians128 {
     pub fn from_rows_96x128(rows: &[u128; 128]) -> Self {
-        Self::from_row_masks(96, rows)
+        Self::from_boolean_matrix(&BooleanMatrix::from_rows_u128(96, rows))
     }
 }
 
 impl FourRussians192 {
     pub fn from_rows_96x192(rows: &[u128; 192]) -> Self {
-        Self::from_row_masks(96, rows)
+        Self::from_boolean_matrix(&BooleanMatrix::from_rows_u128(96, rows))
     }
 }
 
 impl FourRussians256 {
     pub fn from_rows_96x256(rows: &[u128; 256]) -> Self {
-        Self::from_row_masks(96, rows)
+        Self::from_boolean_matrix(&BooleanMatrix::from_rows_u128(96, rows))
     }
 }
 
 impl<const OUT: usize> FourRussiansMatrix<OUT> {
-    pub fn from_row_masks(input_len: usize, rows: &[u128; OUT]) -> Self {
-        assert!(input_len > 0);
-        assert_eq!(input_len % 8, 0);
-        assert!(input_len <= u128::BITS as usize);
+    pub fn from_boolean_matrix(matrix: &BooleanMatrix<OUT>) -> Self {
+        assert_eq!(matrix.input_len() % 8, 0);
 
+        let input_len = matrix.input_len();
         let groups = input_len / 8;
         let mut windows = vec![0u8; groups * OUT];
         for group in 0..groups {
-            let shift = group * 8;
             for row_idx in 0..OUT {
-                windows[group * OUT + row_idx] = ((rows[row_idx] >> shift) & 0xff) as u8;
+                windows[group * OUT + row_idx] = matrix.window(row_idx, group);
             }
         }
         Self { input_len, windows }

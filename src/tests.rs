@@ -1,7 +1,7 @@
 use crate::boolpoly::{self, BoolPoly};
 use crate::challenger::{Challenger, FsChallenger, ProofReader, ProofTranscript, ProofWriter};
 use crate::field::{self, F128};
-use crate::matrix::{FourRussians128, FourRussians192, FourRussians256, PACKED_U64S};
+use crate::matrix::{BooleanMatrix, FourRussians128, FourRussians256, PACKED_U64S};
 use crate::rmfe;
 
 #[test]
@@ -66,34 +66,37 @@ fn transcript_observes_only_safe_messages() {
 #[test]
 fn four_russians_96x128_matches_naive() {
     let rows: [u128; 128] = core::array::from_fn(|idx| row_mask(idx as u128));
-    let matrix = FourRussians128::from_rows_96x128(&rows);
+    let normal = BooleanMatrix::from_rows_u128(96, &rows);
+    let matrix = FourRussians128::from_boolean_matrix(&normal);
     let input = packed_input_96();
     let mut fast = vec![0u64; 128 * PACKED_U64S];
     let mut slow = vec![0u64; 128 * PACKED_U64S];
     matrix.apply(&input, &mut fast);
-    naive_apply(&rows, &input, &mut slow);
+    naive_apply(&normal, &input, &mut slow);
     assert_eq!(fast, slow);
 }
 
 #[test]
 fn four_russians_96x256_matches_naive() {
     let rows: [u128; 256] = core::array::from_fn(|idx| row_mask((idx * 17) as u128));
-    let matrix = FourRussians256::from_rows_96x256(&rows);
+    let normal = BooleanMatrix::from_rows_u128(96, &rows);
+    let matrix = FourRussians256::from_boolean_matrix(&normal);
     let input = packed_input_96();
     let mut fast = vec![0u64; 256 * PACKED_U64S];
     let mut slow = vec![0u64; 256 * PACKED_U64S];
     matrix.apply(&input, &mut fast);
-    naive_apply(&rows, &input, &mut slow);
+    naive_apply(&normal, &input, &mut slow);
     assert_eq!(fast, slow);
 }
 
 #[test]
 fn rmfe_subspace_validates() {
     assert_eq!(rmfe::validate_rmfe(), Ok(()));
-    let (product, basis, rows) = rmfe::test_build_subspace().unwrap();
+    let (product, basis, embedding, projection) = rmfe::test_build_subspace().unwrap();
     assert_eq!(product.degree(), Some(rmfe::PRODUCT_DEGREE));
     assert!(basis.iter().all(|poly| poly.degree().unwrap() < rmfe::PRODUCT_DEGREE));
-    assert_eq!(&rows, rmfe::embedding_rows());
+    assert_eq!(&embedding, rmfe::embedding_matrix());
+    assert_eq!(&projection, rmfe::projection_matrix());
 }
 
 #[test]
@@ -101,23 +104,23 @@ fn rmfe_embedding_matrix_is_linear() {
     let a = 0x1234_5678_9abc_def0_1357_2468u128;
     let b = 0xfedc_ba98_7654_3210_aaaa_5555u128;
     assert_eq!(
-        apply_embedding_rows(a ^ b),
-        apply_embedding_rows(a) ^ apply_embedding_rows(b),
+        apply_embedding_matrix(a ^ b),
+        apply_embedding_matrix(a) ^ apply_embedding_matrix(b),
     );
-    assert_eq!(apply_embedding_rows(0), BoolPoly::ZERO);
+    assert_eq!(apply_embedding_matrix(0), BoolPoly::ZERO);
 }
 
 #[test]
 fn rmfe_embedding_matrix_matches_basis() {
-    let (_, basis, _) = rmfe::test_build_subspace().unwrap();
+    let (_, basis, _, _) = rmfe::test_build_subspace().unwrap();
     for bit in [0usize, 1, 17, 63, 64, 95] {
-        assert_eq!(apply_embedding_rows(1u128 << bit), basis[bit]);
+        assert_eq!(apply_embedding_matrix(1u128 << bit), basis[bit]);
     }
 }
 
 #[test]
-fn rmfe_embedding_rows_work_with_matrix_kernel() {
-    let matrix = FourRussians192::from_rows_96x192(rmfe::embedding_rows());
+fn rmfe_embedding_matrix_works_with_effective_kernel() {
+    let matrix = crate::matrix::FourRussians192::from_boolean_matrix(rmfe::embedding_matrix());
     let input_words = [0x1234_5678_9abc_def0_1357_2468u128, 0x5a5a, 0, (1u128 << 95) | 7];
     let mut input = vec![0u64; 96 * PACKED_U64S];
     for bit in 0..96 {
@@ -132,7 +135,7 @@ fn rmfe_embedding_rows_work_with_matrix_kernel() {
     matrix.apply(&input, &mut out);
 
     for lane in 0..4 {
-        let expected = apply_embedding_rows(input_words[lane]);
+        let expected = apply_embedding_matrix(input_words[lane]);
         let mut actual = BoolPoly::ZERO;
         for coeff in 0..192 {
             let block = read_packed_block(&out[coeff * PACKED_U64S..][..PACKED_U64S]);
@@ -141,6 +144,19 @@ fn rmfe_embedding_rows_work_with_matrix_kernel() {
             }
         }
         assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn rmfe_projection_has_multiplicative_friendly_property() {
+    let (_, basis, _, _) = rmfe::test_build_subspace().unwrap();
+    for i in 0..rmfe::RMFE_BITS {
+        for j in 0..rmfe::RMFE_BITS {
+            let product = boolpoly::clmul_192(basis[i], basis[j]);
+            let projected = apply_projection_matrix(product);
+            let expected = if i == j { basis[i] } else { BoolPoly::ZERO };
+            assert_eq!(projected, expected, "failed at ({i}, {j})");
+        }
     }
 }
 
@@ -176,20 +192,19 @@ fn packed_input_96() -> Vec<u64> {
 }
 
 fn naive_apply<const OUT: usize>(
-    rows: &[u128; OUT],
+    matrix: &BooleanMatrix<OUT>,
     input: &[u64],
     out: &mut [u64],
 ) {
     out.fill(0);
     for row_idx in 0..OUT {
-        let mut mask = rows[row_idx];
-        while mask != 0 {
-            let bit = mask.trailing_zeros() as usize;
-            xor_packed_block(
-                &mut out[row_idx * PACKED_U64S..][..PACKED_U64S],
-                &input[bit * PACKED_U64S..][..PACKED_U64S],
-            );
-            mask &= mask - 1;
+        for bit in 0..matrix.input_len() {
+            if matrix.get(row_idx, bit) {
+                xor_packed_block(
+                    &mut out[row_idx * PACKED_U64S..][..PACKED_U64S],
+                    &input[bit * PACKED_U64S..][..PACKED_U64S],
+                );
+            }
         }
     }
 }
@@ -229,12 +244,26 @@ fn xor_packed_block(out: &mut [u64], rhs: &[u64]) {
     }
 }
 
-fn apply_embedding_rows(word: u128) -> BoolPoly {
-    let rows = rmfe::embedding_rows();
+fn apply_embedding_matrix(word: u128) -> BoolPoly {
+    apply_matrix_to_poly(rmfe::embedding_matrix(), &[word as u64, (word >> 64) as u64])
+}
+
+fn apply_projection_matrix(product: boolpoly::WideBoolPoly) -> BoolPoly {
+    apply_matrix_to_poly(rmfe::projection_matrix(), &product.limbs())
+}
+
+fn apply_matrix_to_poly<const OUT: usize>(matrix: &BooleanMatrix<OUT>, input: &[u64]) -> BoolPoly {
+    assert_eq!(OUT, rmfe::PRODUCT_DEGREE);
+    assert_eq!(input.len(), matrix.words_per_row());
     let mut limbs = [0u64; 4];
-    for coeff in 0..rmfe::PRODUCT_DEGREE {
-        if (rows[coeff] & word).count_ones() & 1 == 1 {
-            limbs[coeff / 64] ^= 1u64 << (coeff % 64);
+    for row in 0..OUT {
+        let parity = matrix
+            .row(row)
+            .iter()
+            .zip(input)
+            .fold(0u32, |acc, (&a, &b)| acc ^ ((a & b).count_ones() & 1));
+        if parity != 0 {
+            limbs[row / 64] ^= 1u64 << (row % 64);
         }
     }
     BoolPoly::from_limbs(limbs)

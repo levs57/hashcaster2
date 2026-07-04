@@ -9,9 +9,11 @@
 use std::sync::OnceLock;
 
 use crate::boolpoly::{self, BoolPoly};
+use crate::matrix::BooleanMatrix;
 
 pub const RMFE_BITS: usize = 96;
 pub const PRODUCT_DEGREE: usize = 192;
+pub const PRODUCT_BITS: usize = 2 * PRODUCT_DEGREE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RmfeValidationError {
@@ -22,8 +24,12 @@ pub enum RmfeValidationError {
     DependentGlobalBasis,
 }
 
-pub fn embedding_rows() -> &'static [u128; PRODUCT_DEGREE] {
-    &subspace().embedding_rows
+pub fn embedding_matrix() -> &'static BooleanMatrix<PRODUCT_DEGREE> {
+    &subspace().embedding_matrix
+}
+
+pub fn projection_matrix() -> &'static BooleanMatrix<PRODUCT_DEGREE> {
+    &subspace().projection_matrix
 }
 
 pub fn validate_rmfe() -> Result<(), RmfeValidationError> {
@@ -31,11 +37,13 @@ pub fn validate_rmfe() -> Result<(), RmfeValidationError> {
 }
 
 struct RmfeSubspace {
-    embedding_rows: [u128; PRODUCT_DEGREE],
+    embedding_matrix: BooleanMatrix<PRODUCT_DEGREE>,
+    projection_matrix: BooleanMatrix<PRODUCT_DEGREE>,
 }
 
-struct BuiltSubspace {
-    embedding_rows: [u128; PRODUCT_DEGREE],
+struct RmfeSubspaceBuilder {
+    embedding_matrix: BooleanMatrix<PRODUCT_DEGREE>,
+    projection_matrix: BooleanMatrix<PRODUCT_DEGREE>,
     #[cfg(test)]
     product_modulus: BoolPoly,
     #[cfg(test)]
@@ -47,7 +55,8 @@ fn subspace() -> &'static RmfeSubspace {
     SUBSPACE.get_or_init(|| {
         let built = build_subspace().expect("hardcoded RMFE constants must validate");
         RmfeSubspace {
-            embedding_rows: built.embedding_rows,
+            embedding_matrix: built.embedding_matrix,
+            projection_matrix: built.projection_matrix,
         }
     })
 }
@@ -93,14 +102,17 @@ const FACTORS: [FactorSpec; 30] = [
     FactorSpec { degree: 8, modulus: 0b101110001, rmfe_bits: 4, basis: [0xd2, 0x4b, 0xb0, 0x5b] },
 ];
 
-fn build_subspace() -> Result<BuiltSubspace, RmfeValidationError> {
+fn build_subspace() -> Result<RmfeSubspaceBuilder, RmfeValidationError> {
     let total_degree: usize = FACTORS.iter().map(|factor| factor.degree).sum();
     if total_degree != PRODUCT_DEGREE {
         return Err(RmfeValidationError::WrongTotalDegree);
     }
 
+    let mut local_projections = Vec::with_capacity(FACTORS.len());
     for (factor_idx, factor) in FACTORS.iter().enumerate() {
-        if !valid_local_rmfe_basis(factor.modulus, factor.degree, &factor.basis[..factor.rmfe_bits]) {
+        if let Some(projection) = build_local_projection(factor.modulus, factor.degree, &factor.basis[..factor.rmfe_bits]) {
+            local_projections.push(projection);
+        } else {
             return Err(RmfeValidationError::InvalidLocalBasis { factor: factor_idx });
         }
     }
@@ -154,8 +166,9 @@ fn build_subspace() -> Result<BuiltSubspace, RmfeValidationError> {
     let basis: [BoolPoly; RMFE_BITS] = basis
         .try_into()
         .map_err(|_| RmfeValidationError::WrongBasisLength)?;
-    Ok(BuiltSubspace {
-        embedding_rows: build_embedding_rows(&basis),
+    Ok(RmfeSubspaceBuilder {
+        embedding_matrix: build_embedding_matrix(&basis),
+        projection_matrix: build_projection_matrix(product, &local_projections),
         #[cfg(test)]
         product_modulus: product,
         #[cfg(test)]
@@ -163,32 +176,102 @@ fn build_subspace() -> Result<BuiltSubspace, RmfeValidationError> {
     })
 }
 
-fn build_embedding_rows(basis: &[BoolPoly; RMFE_BITS]) -> [u128; PRODUCT_DEGREE] {
-    let mut rows = [0u128; PRODUCT_DEGREE];
+fn build_embedding_matrix(basis: &[BoolPoly; RMFE_BITS]) -> BooleanMatrix<PRODUCT_DEGREE> {
+    let mut matrix = BooleanMatrix::zero(RMFE_BITS);
     for (input_bit, &poly) in basis.iter().enumerate() {
-        for (coeff, row) in rows.iter_mut().enumerate() {
+        for coeff in 0..PRODUCT_DEGREE {
             if poly.bit(coeff) {
-                *row |= 1u128 << input_bit;
+                matrix.set(coeff, input_bit);
             }
         }
     }
-    rows
+    matrix
 }
 
-fn valid_local_rmfe_basis(modulus: u16, degree: usize, basis: &[u16]) -> bool {
-    let mut pivots = vec![0u16; degree];
-    let mut targets = vec![0u16; degree];
+fn build_projection_matrix(
+    product: BoolPoly,
+    local_projections: &[LocalProjection],
+) -> BooleanMatrix<PRODUCT_DEGREE> {
+    let mut lift_data = Vec::with_capacity(FACTORS.len());
+    for factor in FACTORS {
+        let quotient = boolpoly::div_exact_u16(product, factor.modulus);
+        let quotient_mod = boolpoly::mod_u16(quotient, factor.modulus);
+        let quotient_inv = boolpoly::gf_inv(quotient_mod, factor.modulus)
+            .expect("CRT quotient is invertible modulo a coprime factor");
+        lift_data.push((factor.modulus, quotient, quotient_inv));
+    }
+
+    let mut matrix = BooleanMatrix::zero(PRODUCT_BITS);
+    for input_bit in 0..PRODUCT_BITS {
+        let mut output = BoolPoly::ZERO;
+        for (factor_idx, &(modulus, quotient, quotient_inv)) in lift_data.iter().enumerate() {
+            let residue = monomial_mod_u16(input_bit, modulus);
+            let projected = local_projections[factor_idx].apply(residue);
+            if projected != 0 {
+                let scaled = boolpoly::gf_mul(projected, quotient_inv, modulus);
+                output ^= boolpoly::mul_mod_small(quotient, scaled, product);
+            }
+        }
+        for coeff in 0..PRODUCT_DEGREE {
+            if output.bit(coeff) {
+                matrix.set(coeff, input_bit);
+            }
+        }
+    }
+    matrix
+}
+
+#[derive(Clone, Copy)]
+struct LocalProjection {
+    pivots: [u16; 16],
+    targets: [u16; 16],
+}
+
+impl LocalProjection {
+    fn apply(self, mut vector: u16) -> u16 {
+        let mut target = 0u16;
+        while vector != 0 {
+            let bit = boolpoly::poly_degree_u16(vector) as usize;
+            if self.pivots[bit] == 0 {
+                vector ^= 1u16 << bit;
+            } else {
+                vector ^= self.pivots[bit];
+                target ^= self.targets[bit];
+            }
+        }
+        target
+    }
+}
+
+fn build_local_projection(modulus: u16, degree: usize, basis: &[u16]) -> Option<LocalProjection> {
+    let mut projection = LocalProjection {
+        pivots: [0; 16],
+        targets: [0; 16],
+    };
 
     for i in 0..basis.len() {
         for j in i..basis.len() {
             let product = boolpoly::gf_mul(basis[i], basis[j], modulus);
             let target = if i == j { basis[i] } else { 0 };
-            if !insert_linear_constraint(product, target, &mut pivots, &mut targets) {
-                return false;
+            if !insert_linear_constraint(
+                product,
+                target,
+                &mut projection.pivots[..degree],
+                &mut projection.targets[..degree],
+            ) {
+                return None;
             }
         }
     }
-    true
+    Some(projection)
+}
+
+fn monomial_mod_u16(degree: usize, modulus: u16) -> u16 {
+    let mut out = 1u16;
+    for _ in 0..degree {
+        out = boolpoly::gf_mul(out, 0b10, modulus);
+    }
+    out
 }
 
 fn insert_linear_constraint(
@@ -232,6 +315,6 @@ fn insert_global_vector(mut vector: BoolPoly, pivots: &mut [BoolPoly; PRODUCT_DE
 }
 
 #[cfg(test)]
-pub(crate) fn test_build_subspace() -> Result<(BoolPoly, [BoolPoly; RMFE_BITS], [u128; PRODUCT_DEGREE]), RmfeValidationError> {
-    build_subspace().map(|built| (built.product_modulus, built.basis, built.embedding_rows))
+pub(crate) fn test_build_subspace() -> Result<(BoolPoly, [BoolPoly; RMFE_BITS], BooleanMatrix<PRODUCT_DEGREE>, BooleanMatrix<PRODUCT_DEGREE>), RmfeValidationError> {
+    build_subspace().map(|built| (built.product_modulus, built.basis, built.embedding_matrix, built.projection_matrix))
 }
