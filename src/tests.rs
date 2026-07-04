@@ -1,6 +1,7 @@
 use crate::challenger::{Challenger, FsChallenger, ProofReader, ProofTranscript, ProofWriter};
 use crate::field::{self, F128};
 use crate::matrix::{FourRussians128, FourRussians256, Packed4x96};
+use crate::rmfe::{self, BoolPoly};
 
 #[test]
 fn field_basics() {
@@ -83,6 +84,24 @@ fn four_russians_96x256_matches_naive() {
     matrix.apply(&input, &mut fast);
     naive_apply(&rows, &input, &mut slow);
     assert_eq!(fast, slow);
+}
+
+#[test]
+fn rmfe_subspace_validates() {
+    assert_eq!(rmfe::validate_rmfe(), Ok(()));
+    assert_eq!(rmfe::basis_elements().len(), rmfe::RMFE_BITS);
+    assert_eq!(rmfe::product_modulus().degree(), Some(rmfe::PRODUCT_DEGREE));
+    assert!(rmfe::basis_elements()
+        .iter()
+        .all(|poly| poly.degree().unwrap() < rmfe::PRODUCT_DEGREE));
+}
+
+#[test]
+fn rmfe_embedding_is_linear() {
+    let a = 0x1234_5678_9abc_def0_1357_2468u128;
+    let b = 0xfedc_ba98_7654_3210_aaaa_5555u128;
+    assert_eq!(rmfe::embed_word(a ^ b), rmfe::embed_word(a) ^ rmfe::embed_word(b));
+    assert_eq!(rmfe::embed_word(0), BoolPoly::ZERO);
 }
 
 fn row_mask(seed: u128) -> u128 {
