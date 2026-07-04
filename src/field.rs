@@ -205,7 +205,39 @@ mod software {
         (v2 as u64 as u128) | ((v3 as u64 as u128) << 64)
     }
 
+    #[inline(always)]
     fn clmul64(a: u64, b: u64) -> u128 {
+        let lo = bmul64(a, b);
+        let hi = rev64(bmul64(rev64(a), rev64(b))) >> 1;
+        (lo as u128) | ((hi as u128) << 64)
+    }
+
+    #[cfg(test)]
+    pub(super) fn mul_128_bitserial(a: u128, b: u128) -> u128 {
+        let a_lo = a as u64;
+        let a_hi = (a >> 64) as u64;
+        let b_lo = b as u64;
+        let b_hi = (b >> 64) as u64;
+
+        let z0 = clmul64_bitserial(a_lo, b_lo);
+        let z1 = clmul64_bitserial(a_hi, b_hi);
+        let z2 = clmul64_bitserial(a_lo ^ a_hi, b_lo ^ b_hi) ^ z0 ^ z1;
+
+        let v0 = z0;
+        let mut v1 = swap64(z0) ^ z2;
+        let mut v2 = z1 ^ swap64(z2);
+        let mut v3 = swap64(z1);
+
+        v2 ^= v0 ^ shr64_lanes(v0, 1) ^ shr64_lanes(v0, 2) ^ shr64_lanes(v0, 7);
+        v1 ^= shl64_lanes(v0, 63) ^ shl64_lanes(v0, 62) ^ shl64_lanes(v0, 57);
+        v3 ^= v1 ^ shr64_lanes(v1, 1) ^ shr64_lanes(v1, 2) ^ shr64_lanes(v1, 7);
+        v2 ^= shl64_lanes(v1, 63) ^ shl64_lanes(v1, 62) ^ shl64_lanes(v1, 57);
+
+        (v2 as u64 as u128) | ((v3 as u64 as u128) << 64)
+    }
+
+    #[cfg(test)]
+    fn clmul64_bitserial(a: u64, b: u64) -> u128 {
         let mut out = 0u128;
         for bit in 0..64 {
             if ((b >> bit) & 1) != 0 {
@@ -213,6 +245,51 @@ mod software {
             }
         }
         out
+    }
+
+    #[inline(always)]
+    fn bmul64(x: u64, y: u64) -> u64 {
+        let x0 = x & 0x1111_1111_1111_1111;
+        let x1 = x & 0x2222_2222_2222_2222;
+        let x2 = x & 0x4444_4444_4444_4444;
+        let x3 = x & 0x8888_8888_8888_8888;
+        let y0 = y & 0x1111_1111_1111_1111;
+        let y1 = y & 0x2222_2222_2222_2222;
+        let y2 = y & 0x4444_4444_4444_4444;
+        let y3 = y & 0x8888_8888_8888_8888;
+
+        let z0 = (x0.wrapping_mul(y0)
+            ^ x1.wrapping_mul(y3)
+            ^ x2.wrapping_mul(y2)
+            ^ x3.wrapping_mul(y1))
+            & 0x1111_1111_1111_1111;
+        let z1 = (x0.wrapping_mul(y1)
+            ^ x1.wrapping_mul(y0)
+            ^ x2.wrapping_mul(y3)
+            ^ x3.wrapping_mul(y2))
+            & 0x2222_2222_2222_2222;
+        let z2 = (x0.wrapping_mul(y2)
+            ^ x1.wrapping_mul(y1)
+            ^ x2.wrapping_mul(y0)
+            ^ x3.wrapping_mul(y3))
+            & 0x4444_4444_4444_4444;
+        let z3 = (x0.wrapping_mul(y3)
+            ^ x1.wrapping_mul(y2)
+            ^ x2.wrapping_mul(y1)
+            ^ x3.wrapping_mul(y0))
+            & 0x8888_8888_8888_8888;
+
+        z0 | z1 | z2 | z3
+    }
+
+    #[inline(always)]
+    fn rev64(mut x: u64) -> u64 {
+        x = ((x & 0x5555_5555_5555_5555) << 1) | ((x >> 1) & 0x5555_5555_5555_5555);
+        x = ((x & 0x3333_3333_3333_3333) << 2) | ((x >> 2) & 0x3333_3333_3333_3333);
+        x = ((x & 0x0f0f_0f0f_0f0f_0f0f) << 4) | ((x >> 4) & 0x0f0f_0f0f_0f0f_0f0f);
+        x = ((x & 0x00ff_00ff_00ff_00ff) << 8) | ((x >> 8) & 0x00ff_00ff_00ff_00ff);
+        x = ((x & 0x0000_ffff_0000_ffff) << 16) | ((x >> 16) & 0x0000_ffff_0000_ffff);
+        x.rotate_left(32)
     }
 
     #[inline(always)]
@@ -230,4 +307,9 @@ mod software {
         ((x as u64).wrapping_shl(shift) as u128)
             | (((x >> 64) as u64).wrapping_shl(shift) as u128) << 64
     }
+}
+
+#[cfg(test)]
+pub(crate) fn mul_reference_bitserial(a: u128, b: u128) -> u128 {
+    software::mul_128_bitserial(a, b)
 }

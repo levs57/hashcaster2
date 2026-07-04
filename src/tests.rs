@@ -1,5 +1,5 @@
 use crate::challenger::{Challenger, FsChallenger, ProofReader, ProofTranscript, ProofWriter};
-use crate::field::F128;
+use crate::field::{self, F128};
 use crate::matrix::{FourRussians128, FourRussians256, Packed4x96};
 
 #[test]
@@ -15,6 +15,26 @@ fn field_basics() {
         let x = F128::from_raw(state);
         assert_eq!(x * F128::ONE, x);
         assert_eq!(F128::ONE * x, x);
+    }
+}
+
+#[test]
+fn field_mul_matches_bitserial_reference() {
+    let mut state = 0x5e8b_39d7_f4a7_c15d_1234_5678_9abc_def0u128;
+    for _ in 0..256 {
+        state = state
+            .wrapping_mul(0xda94_2042_e4dd_58b5_94d0_49bb_1331_11eb)
+            .rotate_left(37);
+        let a = state;
+        state = state
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15_d1b5_4a32_d192_ed03)
+            .rotate_left(19);
+        let b = state;
+
+        assert_eq!(
+            (F128::from_raw(a) * F128::from_raw(b)).raw(),
+            field::mul_reference_bitserial(a, b)
+        );
     }
 }
 
