@@ -195,6 +195,7 @@ mod x86 {
 mod aarch64 {
     use core::arch::aarch64::*;
 
+    #[inline]
     #[target_feature(enable = "aes")]
     pub unsafe fn mul_128(a: u128, b: u128) -> u128 {
         let a_lo = a as u64;
@@ -202,46 +203,50 @@ mod aarch64 {
         let b_lo = b as u64;
         let b_hi = (b >> 64) as u64;
 
+        // Karatsuba 64x64 -> 128 carryless products: z0, z1, and the middle
+        // term z2 = clmul(a_lo^a_hi, b_lo^b_hi) ^ z0 ^ z1.
         let z0 = core::mem::transmute::<_, uint64x2_t>(vmull_p64(a_lo, b_lo));
         let z1 = core::mem::transmute::<_, uint64x2_t>(vmull_p64(a_hi, b_hi));
         let mid = core::mem::transmute::<_, uint64x2_t>(vmull_p64(a_lo ^ a_hi, b_lo ^ b_hi));
         let z2 = veorq_u64(mid, veorq_u64(z0, z1));
 
-        let v0 = z0;
-        let mut v1 = veorq_u64(vextq_u64::<1>(z0, z0), z2);
-        let mut v2 = veorq_u64(z1, vextq_u64::<1>(z2, z2));
-        let mut v3 = vextq_u64::<1>(z1, z1);
+        // The 256-bit product as four 64-bit words (L0,L1,L2,L3), low to high:
+        //   lo = (L0, L1) = z0 ^ (0, z2.lo)
+        //   hi = (L2, L3) = z1 ^ (z2.hi, 0)
+        let zero = vdupq_n_u64(0);
+        let lo = veorq_u64(z0, vextq_u64::<1>(zero, z2));
+        let hi = veorq_u64(z1, vextq_u64::<1>(z2, zero));
 
-        v2 = veorq_u64(
-            v2,
-            veorq_u64(
-                veorq_u64(v0, vshrq_n_u64::<1>(v0)),
-                veorq_u64(vshrq_n_u64::<2>(v0), vshrq_n_u64::<7>(v0)),
-            ),
-        );
-        v1 = veorq_u64(
-            v1,
-            veorq_u64(
-                vshlq_n_u64::<63>(v0),
-                veorq_u64(vshlq_n_u64::<62>(v0), vshlq_n_u64::<57>(v0)),
-            ),
-        );
-        v3 = veorq_u64(
-            v3,
-            veorq_u64(
-                veorq_u64(v1, vshrq_n_u64::<1>(v1)),
-                veorq_u64(vshrq_n_u64::<2>(v1), vshrq_n_u64::<7>(v1)),
-            ),
-        );
-        v2 = veorq_u64(
-            v2,
-            veorq_u64(
-                vshlq_n_u64::<63>(v1),
-                veorq_u64(vshlq_n_u64::<62>(v1), vshlq_n_u64::<57>(v1)),
-            ),
-        );
+        // Fold the low half into the high half.  For a 64-bit word x, its
+        // reduction contribution is the carryless product clmul(x, C) where
+        // C = 0xC200000000000000 is the POLYVAL reduction constant in the
+        // reversed (POLYVAL) bit order (the *forward*-order 0x87 the old code
+        // used is GHASH's constant and a different field).  Folding a word at
+        // word-position p adds clmul(x,C).lo at p+1 and clmul(x,C).hi ^ x at
+        // p+2.  This matches `software::reduce_karatsuba` exactly.
+        const C: u64 = 0xC200_0000_0000_0000;
+        let cdup = core::mem::transmute::<uint64x2_t, poly64x2_t>(vdupq_n_u64(C));
 
-        (vgetq_lane_u64::<0>(v2) as u128) | ((vgetq_lane_u64::<0>(v3) as u128) << 64)
+        // Fold L0 (lo.lane0): lo.lane1 ^= p0.lo (-> w1); hi.lane0 ^= p0.hi ^ L0.
+        // Read L0 with PMULL2 off a lane-swapped copy so the whole fold stays
+        // in the NEON domain (no GPR round-trip on the latency path).
+        let lo_sw = vextq_u64::<1>(lo, lo); // (L1, L0)
+        let p0 = core::mem::transmute::<_, uint64x2_t>(vmull_high_p64(
+            core::mem::transmute::<uint64x2_t, poly64x2_t>(lo_sw),
+            cdup,
+        ));
+        let lo = veorq_u64(lo, vextq_u64::<1>(zero, p0));
+        let hi = veorq_u64(hi, veorq_u64(vextq_u64::<1>(p0, zero), vzip1q_u64(lo, zero)));
+
+        // Fold w1 (lo.lane1) with PMULL2, reading lane 1 directly (no GPR
+        // round-trip): hi.lane0 ^= p1.lo; hi.lane1 ^= p1.hi ^ w1.
+        let p1 = core::mem::transmute::<_, uint64x2_t>(vmull_high_p64(
+            core::mem::transmute::<uint64x2_t, poly64x2_t>(lo),
+            cdup,
+        ));
+        let hi = veorq_u64(hi, veorq_u64(p1, vzip2q_u64(zero, lo)));
+
+        core::mem::transmute::<uint64x2_t, u128>(hi)
     }
 }
 
