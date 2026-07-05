@@ -108,9 +108,10 @@ impl F128 {
 /// once, in [`F128Acc::finalize`].  This is the fastest way to evaluate
 /// dot-product / inner-product shaped expressions.
 ///
-/// On the AArch64 PMULL backend the two halves are the low/high words of the
-/// carryless product; on other targets `lo` holds the running reduced sum and
-/// `hi` is unused.  Either way the observable result is identical.
+/// On hardware carryless-multiply backends the two halves are the low/high
+/// words of the carryless product; on software fallback targets `lo` holds the
+/// running reduced sum and `hi` is unused.  Either way the observable result is
+/// identical.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct F128Acc {
     lo: u128,
@@ -247,7 +248,32 @@ mod ext {
     }
 }
 
-#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+#[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), target_feature = "pclmulqdq"))]
+mod ext {
+    use super::x86;
+
+    #[inline(always)]
+    pub(super) fn square(a: u128) -> u128 {
+        unsafe { x86::square_128(a) }
+    }
+    #[inline(always)]
+    pub(super) fn dot(a: &[u128], b: &[u128]) -> u128 {
+        unsafe { x86::dot_product(a, b) }
+    }
+    #[inline(always)]
+    pub(super) fn acc_mul(a: u128, b: u128) -> (u128, u128) {
+        unsafe { x86::acc_mul(a, b) }
+    }
+    #[inline(always)]
+    pub(super) fn acc_reduce(lo: u128, hi: u128) -> u128 {
+        unsafe { x86::acc_reduce(lo, hi) }
+    }
+}
+
+#[cfg(not(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(any(target_arch = "x86", target_arch = "x86_64"), target_feature = "pclmulqdq")
+)))]
 mod ext {
     use super::mul_dispatch;
 
@@ -281,6 +307,9 @@ mod x86 {
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use core::mem::transmute;
+
+    const C: u64 = 0xC200_0000_0000_0000;
 
     #[target_feature(enable = "sse2,pclmulqdq")]
     pub unsafe fn mul_128(a: u128, b: u128) -> u128 {
@@ -332,6 +361,83 @@ mod x86 {
         );
 
         core::mem::transmute(_mm_unpacklo_epi64(v2, v3))
+    }
+
+    #[target_feature(enable = "sse2,pclmulqdq")]
+    pub unsafe fn square_128(a: u128) -> u128 {
+        let z0 = clmul64(a as u64, a as u64);
+        let z1 = clmul64((a >> 64) as u64, (a >> 64) as u64);
+        acc_reduce(z0, z1)
+    }
+
+    #[target_feature(enable = "sse2,pclmulqdq")]
+    pub unsafe fn dot_product(a: &[u128], b: &[u128]) -> u128 {
+        let n = a.len();
+        let mut lo0 = 0u128;
+        let mut hi0 = 0u128;
+        let mut lo1 = 0u128;
+        let mut hi1 = 0u128;
+
+        let mut i = 0;
+        while i + 2 <= n {
+            let (l0, h0) = acc_mul(a[i], b[i]);
+            let (l1, h1) = acc_mul(a[i + 1], b[i + 1]);
+            lo0 ^= l0;
+            hi0 ^= h0;
+            lo1 ^= l1;
+            hi1 ^= h1;
+            i += 2;
+        }
+        if i < n {
+            let (l0, h0) = acc_mul(a[i], b[i]);
+            lo0 ^= l0;
+            hi0 ^= h0;
+        }
+
+        acc_reduce(lo0 ^ lo1, hi0 ^ hi1)
+    }
+
+    #[target_feature(enable = "sse2,pclmulqdq")]
+    pub unsafe fn acc_mul(a: u128, b: u128) -> (u128, u128) {
+        let a_lo = a as u64;
+        let a_hi = (a >> 64) as u64;
+        let b_lo = b as u64;
+        let b_hi = (b >> 64) as u64;
+
+        let z0 = clmul64(a_lo, b_lo);
+        let z1 = clmul64(a_hi, b_hi);
+        let z2 = clmul64(a_lo ^ a_hi, b_lo ^ b_hi) ^ z0 ^ z1;
+
+        let lo = (z0 as u64 as u128) | (((z0 >> 64) ^ (z2 as u64 as u128)) << 64);
+        let hi = ((z1 as u64 as u128) ^ (z2 >> 64)) | ((z1 >> 64) << 64);
+        (lo, hi)
+    }
+
+    #[target_feature(enable = "sse2,pclmulqdq")]
+    pub unsafe fn acc_reduce(lo: u128, hi: u128) -> u128 {
+        let w0 = lo as u64;
+        let w1 = (lo >> 64) as u64;
+        let w2 = hi as u64;
+        let w3 = (hi >> 64) as u64;
+
+        // Fold word 0, then fold the updated word 1.  This is the scalar
+        // counterpart of the AArch64 PMULL reducer.
+        let p0 = clmul64(w0, C);
+        let w1 = w1 ^ (p0 as u64);
+        let mut h0 = w2 ^ ((p0 >> 64) as u64) ^ w0;
+
+        let p1 = clmul64(w1, C);
+        h0 ^= p1 as u64;
+        let h1 = w3 ^ ((p1 >> 64) as u64) ^ w1;
+
+        (h0 as u128) | ((h1 as u128) << 64)
+    }
+
+    #[inline(always)]
+    unsafe fn clmul64(a: u64, b: u64) -> u128 {
+        let av = _mm_set_epi64x(0, a as i64);
+        let bv = _mm_set_epi64x(0, b as i64);
+        transmute(_mm_clmulepi64_si128(av, bv, 0x00))
     }
 
     #[inline(always)]
