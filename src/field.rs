@@ -6,6 +6,9 @@
 
 use core::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
 
+#[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+compile_error!("hashcaster2 requires AArch64 crypto/PMULL support; build with -C target-cpu=native or -C target-feature=+aes");
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(transparent)]
 pub struct F128 {
@@ -100,8 +103,16 @@ fn mul_dispatch(a: u128, b: u128) -> u128 {
     unsafe { x86::mul_128(a, b) }
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+fn mul_dispatch(a: u128, b: u128) -> u128 {
+    unsafe { aarch64::mul_128(a, b) }
+}
+
 #[cfg(not(any(
-    all(any(target_arch = "x86", target_arch = "x86_64"), target_feature = "pclmulqdq")
+    all(any(target_arch = "x86", target_arch = "x86_64"), target_feature = "pclmulqdq"),
+    all(target_arch = "aarch64", target_feature = "aes"),
+    target_arch = "aarch64"
 )))]
 #[inline(always)]
 fn mul_dispatch(a: u128, b: u128) -> u128 {
@@ -179,6 +190,31 @@ mod x86 {
     }
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[allow(dead_code, unsafe_op_in_unsafe_fn)]
+mod aarch64 {
+    use core::arch::aarch64::*;
+
+    #[target_feature(enable = "aes")]
+    pub unsafe fn mul_128(a: u128, b: u128) -> u128 {
+        let a_lo = a as u64;
+        let a_hi = (a >> 64) as u64;
+        let b_lo = b as u64;
+        let b_hi = (b >> 64) as u64;
+
+        let z0 = clmul64(a_lo, b_lo);
+        let z1 = clmul64(a_hi, b_hi);
+        let z2 = clmul64(a_lo ^ a_hi, b_lo ^ b_hi) ^ z0 ^ z1;
+
+        super::software::reduce_karatsuba(z0, z1, z2)
+    }
+
+    #[inline(always)]
+    unsafe fn clmul64(a: u64, b: u64) -> u128 {
+        core::mem::transmute(vmull_p64(a, b))
+    }
+}
+
 mod software {
     #![allow(dead_code)]
 
@@ -192,6 +228,10 @@ mod software {
         let z1 = clmul64(a_hi, b_hi);
         let z2 = clmul64(a_lo ^ a_hi, b_lo ^ b_hi) ^ z0 ^ z1;
 
+        reduce_karatsuba(z0, z1, z2)
+    }
+
+    pub(super) fn reduce_karatsuba(z0: u128, z1: u128, z2: u128) -> u128 {
         let v0 = z0;
         let mut v1 = swap64(z0) ^ z2;
         let mut v2 = z1 ^ swap64(z2);

@@ -310,6 +310,14 @@ fn clmul_64(lhs: u64, rhs: u64) -> u128 {
         return clmul_64_x86(lhs, rhs);
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    unsafe {
+        return clmul_64_aarch64(lhs, rhs);
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+    compile_error!("hashcaster2 requires AArch64 crypto/PMULL support; build with -C target-cpu=native or -C target-feature=+aes");
+
     #[allow(unreachable_code)]
     {
     let mut out = 0u128;
@@ -343,6 +351,14 @@ unsafe fn clmul_64_x86(lhs: u64, rhs: u64) -> u128 {
     };
     let limbs: [u64; 2] = unsafe { core::mem::transmute(product) };
     (limbs[0] as u128) | ((limbs[1] as u128) << 64)
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+unsafe fn clmul_64_aarch64(lhs: u64, rhs: u64) -> u128 {
+    use core::arch::aarch64::vmull_p64;
+
+    unsafe { core::mem::transmute(vmull_p64(lhs, rhs)) }
 }
 
 fn poly_mul_u16(lhs: u16, rhs: u16) -> u32 {
