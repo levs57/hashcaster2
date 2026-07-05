@@ -7,11 +7,41 @@ use crate::{
     boolpoly::{self, BoolPoly, WideBoolPoly},
     challenger::{Challenger, ProofWriter},
     chi_round::verifier::HybridClaim,
-    field::F128,
+    field::{F128, F128Acc},
     protocol_state::{self, KeccakWitness},
     rmfe,
     util::{eq_poly_v, fill_eq_poly_v},
 };
+
+/// Five independent field multiplies by a single loop-invariant scalar `r`,
+/// issued together so the backend overlaps their PMULL+reduction dependency
+/// chains instead of serialising them one product at a time.
+#[inline(always)]
+fn mul5_by_scalar(r: F128, v: [F128; 5]) -> [F128; 5] {
+    [r * v[0], r * v[1], r * v[2], r * v[3], r * v[4]]
+}
+
+/// Sumcheck fold of five independent elements: `out[x] = a[x] + r*(a[x]+b[x])`.
+/// The five `r*(...)` multiplies are the latency-bound part; batching them lets
+/// their PMULL+reduction chains overlap.
+#[inline(always)]
+fn fold5(a: [F128; 5], b: [F128; 5], r: F128) -> [F128; 5] {
+    let diff = [
+        a[0] + b[0],
+        a[1] + b[1],
+        a[2] + b[2],
+        a[3] + b[3],
+        a[4] + b[4],
+    ];
+    let prod = mul5_by_scalar(r, diff);
+    [
+        a[0] + prod[0],
+        a[1] + prod[1],
+        a[2] + prod[2],
+        a[3] + prod[3],
+        a[4] + prod[4],
+    ]
+}
 
 const MAX_BUCKET_BITS: usize = 8;
 const MIN_BUCKET_BITS: usize = 6;
@@ -1363,20 +1393,15 @@ fn fill_folded_hot_state_strips_from_witness(
         let strip = witness.pre_chi_strip(round, y, z);
         let out_strip = &mut state[local_strip * strip_len..][..strip_len];
         for out in 0..next_real_blocks {
+            let a: [F128; 5] = core::array::from_fn(|x| {
+                eval_hot_word_from_strip(strip, real_blocks, 2 * out, x, y, z, round, embed_evals)
+            });
+            let b: [F128; 5] = core::array::from_fn(|x| {
+                eval_hot_word_from_strip(strip, real_blocks, 2 * out + 1, x, y, z, round, embed_evals)
+            });
+            let folded = fold5(a, b, r);
             for x in 0..5 {
-                let lo =
-                    eval_hot_word_from_strip(strip, real_blocks, 2 * out, x, y, z, round, embed_evals);
-                let hi = eval_hot_word_from_strip(
-                    strip,
-                    real_blocks,
-                    2 * out + 1,
-                    x,
-                    y,
-                    z,
-                    round,
-                    embed_evals,
-                );
-                out_strip[out * 5 + x] = lo + r * (lo + hi);
+                out_strip[out * 5 + x] = folded[x];
             }
         }
         if next_real_blocks < out_len {
@@ -1490,19 +1515,33 @@ fn accumulate_chi_gruen(
     values_hi: [F128; 5],
     eq_x: &[F128],
 ) {
+    // `s1 = sum_x eq_x[x]*g1_x` and `sinf = sum_x eq_x[x]*ginf_x` are dot
+    // products; accumulate them unreduced and reduce once. Each `g*` is itself
+    // a sum of two products, so it too is folded into a deferred accumulator
+    // and reduced a single time. This cuts the per-term reduction count from
+    // ~6 to ~2 and leaves the independent PMULLs free to pipeline.
+    let mut g1 = [F128::ZERO; 5];
+    let mut ginf = [F128::ZERO; 5];
     for x in 0..5 {
         let left = (x + 1) % 5;
         let right = (x + 2) % 5;
-        let scale = scale * eq_x[x];
         let c1 = values_hi[x] + values_hi[right];
-        let g1 = values_hi[left] * values_hi[right] + c1 * c1;
         let delta_left = values_lo[left] + values_hi[left];
         let delta_right = values_lo[right] + values_hi[right];
         let delta_c = values_lo[x] + values_hi[x] + delta_right;
-        let g_inf = delta_left * delta_right + delta_c * delta_c;
-        acc[0] += scale * g1;
-        acc[1] += scale * g_inf;
+
+        let mut g1_acc = F128Acc::new();
+        g1_acc.accumulate(values_hi[left], values_hi[right]);
+        g1_acc.accumulate(c1, c1);
+        g1[x] = g1_acc.finalize();
+
+        let mut ginf_acc = F128Acc::new();
+        ginf_acc.accumulate(delta_left, delta_right);
+        ginf_acc.accumulate(delta_c, delta_c);
+        ginf[x] = ginf_acc.finalize();
     }
+    acc[0] += scale * F128::dot_product(&eq_x[..5], &g1);
+    acc[1] += scale * F128::dot_product(&eq_x[..5], &ginf);
 }
 
 #[inline(always)]
@@ -1513,17 +1552,26 @@ fn accumulate_chi_gruen_one_inf(
     values_inf: [F128; 5],
     eq_x: &[F128],
 ) {
+    let mut g1 = [F128::ZERO; 5];
+    let mut ginf = [F128::ZERO; 5];
     for x in 0..5 {
         let left = (x + 1) % 5;
         let right = (x + 2) % 5;
-        let scale = scale * eq_x[x];
         let c1 = values_one[x] + values_one[right];
         let c_inf = values_inf[x] + values_inf[right];
-        let g1 = values_one[left] * values_one[right] + c1 * c1;
-        let g_inf = values_inf[left] * values_inf[right] + c_inf * c_inf;
-        acc[0] += scale * g1;
-        acc[1] += scale * g_inf;
+
+        let mut g1_acc = F128Acc::new();
+        g1_acc.accumulate(values_one[left], values_one[right]);
+        g1_acc.accumulate(c1, c1);
+        g1[x] = g1_acc.finalize();
+
+        let mut ginf_acc = F128Acc::new();
+        ginf_acc.accumulate(values_inf[left], values_inf[right]);
+        ginf_acc.accumulate(c_inf, c_inf);
+        ginf[x] = ginf_acc.finalize();
     }
+    acc[0] += scale * F128::dot_product(&eq_x[..5], &g1);
+    acc[1] += scale * F128::dot_product(&eq_x[..5], &ginf);
 }
 
 fn fold_state(state: &mut [Vec<F128>; 5], active_len: usize, r: F128) {
@@ -1623,11 +1671,21 @@ fn fold_hot_pair_values(strip: &[F128], old_idx: usize, real_blocks: usize, r: F
     } else {
         real_blocks * 5
     };
-    core::array::from_fn(|x| {
-        let a = strip[lo + x];
-        let b = strip[hi + x];
-        a + r * (a + b)
-    })
+    let a = [
+        strip[lo],
+        strip[lo + 1],
+        strip[lo + 2],
+        strip[lo + 3],
+        strip[lo + 4],
+    ];
+    let b = [
+        strip[hi],
+        strip[hi + 1],
+        strip[hi + 2],
+        strip[hi + 3],
+        strip[hi + 4],
+    ];
+    fold5(a, b, r)
 }
 
 fn fold_hot_state_and_next_gruen_strips(
@@ -1737,10 +1795,23 @@ fn fold_hot_state_strips(
             } else {
                 real_blocks * 5
             };
+            let a = [
+                strip[lo],
+                strip[lo + 1],
+                strip[lo + 2],
+                strip[lo + 3],
+                strip[lo + 4],
+            ];
+            let b = [
+                strip[hi],
+                strip[hi + 1],
+                strip[hi + 2],
+                strip[hi + 3],
+                strip[hi + 4],
+            ];
+            let folded = fold5(a, b, r);
             for x in 0..5 {
-                let a = strip[lo + x];
-                let b = strip[hi + x];
-                strip[dst + x] = a + r * (a + b);
+                strip[dst + x] = folded[x];
             }
         }
         if next_real_blocks < out_len {
@@ -1892,14 +1963,21 @@ fn recover_wide_buckets(
             if product.is_zero() {
                 continue;
             }
+            // Fold every set bit of `value` into a single scalar first, so the
+            // (dense, ~384-bit) product is scanned once per bucket instead of
+            // once per set bit — a ~popcount(value)x reduction in XOR traffic.
+            let mut scalar = 0u128;
             let mut bits = value;
             while bits != 0 {
                 let bit = bits.trailing_zeros() as usize;
                 let scalar_bit = bucket_bits * limb_idx + bit;
                 if scalar_bit < 128 {
-                    add_wide_raw_bit(out, product, F128::from_raw(1u128 << scalar_bit));
+                    scalar |= 1u128 << scalar_bit;
                 }
                 bits &= bits - 1;
+            }
+            if scalar != 0 {
+                add_wide_raw_bit(out, product, F128::from_raw(scalar));
             }
         }
     }

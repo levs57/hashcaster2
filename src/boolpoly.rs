@@ -136,22 +136,37 @@ impl std::ops::BitXorAssign for WideBoolPoly {
 }
 
 pub fn clmul_192(lhs: BoolPoly, rhs: BoolPoly) -> WideBoolPoly {
-    let lhs = lhs.limbs();
-    let rhs = rhs.limbs();
-    let mut out = [0u64; 6];
-    for i in 0..3 {
-        for j in 0..3 {
-            let a = lhs[i];
-            let b = rhs[j];
-            if a == 0 || b == 0 {
-                continue;
-            }
-            let product = clmul_64(a, b);
-            out[i + j] ^= product as u64;
-            out[i + j + 1] ^= (product >> 64) as u64;
-        }
-    }
-    WideBoolPoly::from_limbs(out)
+    let a = lhs.limbs();
+    let b = rhs.limbs();
+    let (a0, a1, a2) = (a[0], a[1], a[2]);
+    let (b0, b1, b2) = (b[0], b[1], b[2]);
+
+    // Three-limb Karatsuba over GF(2): six carryless 64x64 products instead of
+    // the nine of the schoolbook form.  The `embed_word_poly` inputs are dense
+    // 192-bit polynomials, so the old zero-skip branches almost never fired and
+    // only cost mispredictions; this variant is branch-free.
+    let p0 = clmul_64(a0, b0);
+    let p1 = clmul_64(a1, b1);
+    let p2 = clmul_64(a2, b2);
+    let p01 = clmul_64(a0 ^ a1, b0 ^ b1);
+    let p02 = clmul_64(a0 ^ a2, b0 ^ b2);
+    let p12 = clmul_64(a1 ^ a2, b1 ^ b2);
+
+    // Coefficient blocks (each a 128-bit carryless product), placed at X^k.
+    let c0 = p0;
+    let c1 = p01 ^ p0 ^ p1;
+    let c2 = p02 ^ p0 ^ p2 ^ p1;
+    let c3 = p12 ^ p1 ^ p2;
+    let c4 = p2;
+
+    WideBoolPoly::from_limbs([
+        c0 as u64,
+        ((c0 >> 64) as u64) ^ (c1 as u64),
+        ((c1 >> 64) as u64) ^ (c2 as u64),
+        ((c2 >> 64) as u64) ^ (c3 as u64),
+        ((c3 >> 64) as u64) ^ (c4 as u64),
+        (c4 >> 64) as u64,
+    ])
 }
 
 pub fn square_192(value: BoolPoly) -> WideBoolPoly {
@@ -383,4 +398,87 @@ fn poly_mod_u32(mut value: u32, modulus: u16) -> u16 {
 fn poly_degree_u32(value: u32) -> u32 {
     debug_assert_ne!(value, 0);
     31 - value.leading_zeros()
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+
+    fn schoolbook_clmul_192(lhs: BoolPoly, rhs: BoolPoly) -> WideBoolPoly {
+        let lhs = lhs.limbs();
+        let rhs = rhs.limbs();
+        let mut out = [0u64; 6];
+        for i in 0..3 {
+            for j in 0..3 {
+                let product = clmul_64(lhs[i], rhs[j]);
+                out[i + j] ^= product as u64;
+                out[i + j + 1] ^= (product >> 64) as u64;
+            }
+        }
+        WideBoolPoly::from_limbs(out)
+    }
+
+    struct Rng(u128);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(0xda94_2042_e4dd_58b5_94d0_49bb_1331_11eb)
+                .rotate_left(37);
+            self.0 as u64
+        }
+        fn poly192(&mut self) -> BoolPoly {
+            BoolPoly::from_limbs([self.next(), self.next(), self.next() & 0xffff_ffff_ffff_ffff, 0])
+        }
+    }
+
+    #[test]
+    fn karatsuba_clmul_192_matches_schoolbook() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15_1234_5678_9abc_def0);
+        for _ in 0..100_000 {
+            let a = rng.poly192();
+            let b = rng.poly192();
+            assert_eq!(clmul_192(a, b).limbs(), schoolbook_clmul_192(a, b).limbs());
+        }
+    }
+
+    #[test]
+    #[ignore = "timing microbenchmark; run with --ignored --nocapture"]
+    fn bench_clmul_192() {
+        use std::time::Instant;
+        let mut rng = Rng(0x1234_5678_9abc_def0_dead_beef_cafe_babe);
+        let inputs: Vec<(BoolPoly, BoolPoly, BoolPoly)> =
+            (0..4096).map(|_| (rng.poly192(), rng.poly192(), rng.poly192())).collect();
+
+        let iters = 2000usize;
+        // Warmup.
+        let mut acc = WideBoolPoly::ZERO;
+        for &(a, b, c) in &inputs {
+            acc ^= clmul_192(a, b) ^ square_192(c);
+        }
+
+        let mut best_new = f64::INFINITY;
+        let mut best_old = f64::INFINITY;
+        for _ in 0..iters {
+            let t = Instant::now();
+            for &(a, b, c) in &inputs {
+                acc ^= clmul_192(a, b) ^ square_192(c);
+            }
+            best_new = best_new.min(t.elapsed().as_secs_f64());
+
+            let t = Instant::now();
+            for &(a, b, c) in &inputs {
+                acc ^= schoolbook_clmul_192(a, b) ^ square_192(c);
+            }
+            best_old = best_old.min(t.elapsed().as_secs_f64());
+        }
+        std::hint::black_box(acc);
+        let n = inputs.len() as f64;
+        println!(
+            "clmul_192^square_192  karatsuba: {:.2} ns/op   schoolbook: {:.2} ns/op   speedup {:.2}x",
+            best_new / n * 1e9,
+            best_old / n * 1e9,
+            best_old / best_new,
+        );
+    }
 }

@@ -37,15 +37,114 @@ impl F128 {
         Self::from_raw(1u128 << bit)
     }
 
+    /// Field squaring, `self * self`.
+    ///
+    /// In GF(2^128) squaring is cheaper than a general multiply: the cross
+    /// term `2*a_lo*a_hi` vanishes, so on the PMULL backend this is two PMULLs
+    /// plus one reduction instead of the three PMULLs a general multiply needs.
+    #[inline(always)]
+    pub fn square(self) -> Self {
+        Self::from_raw(ext::square(self.raw))
+    }
+
+    /// Repeated squaring: returns `self^(2^n)` (the `n`-fold Frobenius).
+    #[inline(always)]
+    fn frobenius(self, n: u32) -> Self {
+        let mut x = self;
+        for _ in 0..n {
+            x = x.square();
+        }
+        x
+    }
+
+    /// Multiplicative inverse.
+    ///
+    /// `a^-1 = a^(2^128 - 2)`.  Computed with an Itoh–Tsujii addition chain for
+    /// `2^127 - 1` (`beta_k = a^(2^k - 1)`), then one final squaring — 12
+    /// multiplies + 127 squarings, versus the naive 127 multiplies + 127
+    /// squarings.  Since a squaring is itself cheaper than a multiply on the
+    /// PMULL backend, this is a large win on the whole inverse.
     pub fn inverse(self) -> Self {
         assert!(self != Self::ZERO);
-        let mut x = self;
-        let mut out = Self::ONE;
-        for _ in 1..128 {
-            x *= x;
-            out *= x;
-        }
-        out
+        let a = self;
+        // beta_k := a^(2^k - 1).  Build up 127 = 1111111b via the recurrences
+        //   beta_{i+j} = (beta_i)^(2^j) * beta_j   (Frobenius then multiply)
+        //   beta_{i+1} = (beta_i)^2 * a.
+        let b1 = a; // 2^1 - 1
+        let b2 = b1.frobenius(1) * b1; // 2^2 - 1
+        let b3 = b2.square() * a; // 2^3 - 1
+        let b6 = b3.frobenius(3) * b3; // 2^6 - 1
+        let b7 = b6.square() * a; // 2^7 - 1
+        let b14 = b7.frobenius(7) * b7; // 2^14 - 1
+        let b15 = b14.square() * a; // 2^15 - 1
+        let b30 = b15.frobenius(15) * b15; // 2^30 - 1
+        let b31 = b30.square() * a; // 2^31 - 1
+        let b62 = b31.frobenius(31) * b31; // 2^62 - 1
+        let b63 = b62.square() * a; // 2^63 - 1
+        let b126 = b63.frobenius(63) * b63; // 2^126 - 1
+        let b127 = b126.square() * a; // 2^127 - 1
+        b127.square() // (2^127 - 1) * 2 = 2^128 - 2
+    }
+
+    /// Deferred-reduction dot product: `sum_i a[i] * b[i]` over the field, with
+    /// a single final reduction.  Much faster than a fold of independent
+    /// multiplies for dot-product-shaped loops.  `a` and `b` must be equal
+    /// length.
+    #[inline]
+    pub fn dot_product(a: &[Self], b: &[Self]) -> Self {
+        assert_eq!(a.len(), b.len());
+        // `F128` is `#[repr(transparent)]` over `u128`, so a `&[F128]` is a
+        // `&[u128]` with the same layout.
+        let ar: &[u128] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const u128, a.len()) };
+        let br: &[u128] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const u128, b.len()) };
+        Self::from_raw(ext::dot(ar, br))
+    }
+}
+
+/// Deferred-reduction multiply-accumulator for GF(2^128).
+///
+/// Accumulates a sum of products `sum_i a_i * b_i` as an *unreduced* 256-bit
+/// value (two 128-bit halves) and applies the expensive field reduction only
+/// once, in [`F128Acc::finalize`].  This is the fastest way to evaluate
+/// dot-product / inner-product shaped expressions.
+///
+/// On the AArch64 PMULL backend the two halves are the low/high words of the
+/// carryless product; on other targets `lo` holds the running reduced sum and
+/// `hi` is unused.  Either way the observable result is identical.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct F128Acc {
+    lo: u128,
+    hi: u128,
+}
+
+impl F128Acc {
+    pub const ZERO: Self = Self { lo: 0, hi: 0 };
+
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::ZERO
+    }
+
+    /// Fold `a * b` into the accumulator (no reduction yet).
+    #[inline(always)]
+    pub fn accumulate(&mut self, a: F128, b: F128) {
+        let (lo, hi) = ext::acc_mul(a.raw, b.raw);
+        self.lo ^= lo;
+        self.hi ^= hi;
+    }
+
+    /// Merge another accumulator into this one (for parallel reduction: sum
+    /// partial accumulators, then finalize once).
+    #[inline(always)]
+    pub fn combine(&mut self, other: &Self) {
+        self.lo ^= other.lo;
+        self.hi ^= other.hi;
+    }
+
+    /// Apply the final field reduction and return the field element.
+    #[inline(always)]
+    pub fn finalize(self) -> F128 {
+        F128::from_raw(ext::acc_reduce(self.lo, self.hi))
     }
 }
 
@@ -117,6 +216,62 @@ fn mul_dispatch(a: u128, b: u128) -> u128 {
 #[inline(always)]
 fn mul_dispatch(a: u128, b: u128) -> u128 {
     software::mul_128(a, b)
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch for the extended field API (square / batched multiply / deferred-
+// reduction accumulator).  The AArch64+PMULL backend gets bespoke SIMD paths;
+// every other target uses portable fallbacks expressed in terms of
+// `mul_dispatch`, so results are identical everywhere (only speed differs).
+// ---------------------------------------------------------------------------
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+mod ext {
+    use super::aarch64;
+
+    #[inline(always)]
+    pub(super) fn square(a: u128) -> u128 {
+        unsafe { aarch64::square_128(a) }
+    }
+    #[inline(always)]
+    pub(super) fn dot(a: &[u128], b: &[u128]) -> u128 {
+        unsafe { aarch64::dot_product(a, b) }
+    }
+    #[inline(always)]
+    pub(super) fn acc_mul(a: u128, b: u128) -> (u128, u128) {
+        unsafe { aarch64::acc_mul(a, b) }
+    }
+    #[inline(always)]
+    pub(super) fn acc_reduce(lo: u128, hi: u128) -> u128 {
+        unsafe { aarch64::acc_reduce(lo, hi) }
+    }
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+mod ext {
+    use super::mul_dispatch;
+
+    #[inline(always)]
+    pub(super) fn square(a: u128) -> u128 {
+        mul_dispatch(a, a)
+    }
+    #[inline(always)]
+    pub(super) fn dot(a: &[u128], b: &[u128]) -> u128 {
+        let mut acc = 0u128;
+        for i in 0..a.len() {
+            acc ^= mul_dispatch(a[i], b[i]);
+        }
+        acc
+    }
+    // Portable accumulator: `lo` holds the running *reduced* sum, `hi` unused.
+    #[inline(always)]
+    pub(super) fn acc_mul(a: u128, b: u128) -> (u128, u128) {
+        (mul_dispatch(a, b), 0)
+    }
+    #[inline(always)]
+    pub(super) fn acc_reduce(lo: u128, _hi: u128) -> u128 {
+        lo
+    }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -194,60 +349,152 @@ mod x86 {
 #[allow(dead_code, unsafe_op_in_unsafe_fn)]
 mod aarch64 {
     use core::arch::aarch64::*;
+    use core::mem::transmute;
+
+    /// POLYVAL reduction constant in reversed (POLYVAL) bit order.  The
+    /// *forward*-order 0x87 is GHASH's constant and a different field.
+    const C: u64 = 0xC200_0000_0000_0000;
+
+    /// Three-way XOR.  Uses the FEAT_SHA3 `EOR3` fused instruction when the
+    /// `sha3` target feature is available (it is under `-C target-cpu=native`
+    /// on Apple M-series), shortening the reduction's XOR tree by one op each.
+    #[cfg(target_feature = "sha3")]
+    #[inline(always)]
+    unsafe fn xor3(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+        veor3q_u64(a, b, c)
+    }
+    #[cfg(not(target_feature = "sha3"))]
+    #[inline(always)]
+    unsafe fn xor3(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+        veorq_u64(a, veorq_u64(b, c))
+    }
+
+    /// 128x128 -> 256-bit carryless product via 3-PMULL Karatsuba, returned as
+    /// unreduced halves `(lo, hi)` where the value is `lo + hi * x^128` and each
+    /// half is a little-endian 64-bit-word pair `(L0,L1)` / `(L2,L3)`.
+    ///
+    /// The forward PMULLs read the operands from GPRs (that is where the u128
+    /// arguments arrive); reduction stays entirely in the NEON domain.
+    #[inline(always)]
+    unsafe fn clmul_wide(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> (uint64x2_t, uint64x2_t) {
+        // Karatsuba: z0 = a_lo*b_lo, z1 = a_hi*b_hi, mid term folds into z2.
+        let z0 = transmute::<_, uint64x2_t>(vmull_p64(a_lo, b_lo));
+        let z1 = transmute::<_, uint64x2_t>(vmull_p64(a_hi, b_hi));
+        let mid = transmute::<_, uint64x2_t>(vmull_p64(a_lo ^ a_hi, b_lo ^ b_hi));
+        let z2 = xor3(mid, z0, z1);
+
+        let zero = vdupq_n_u64(0);
+        let lo = veorq_u64(z0, vextq_u64::<1>(zero, z2));
+        let hi = veorq_u64(z1, vextq_u64::<1>(z2, zero));
+        (lo, hi)
+    }
+
+    /// Squaring specialisation: in GF(2^128) the cross term `2*a_lo*a_hi`
+    /// vanishes, so the middle Karatsuba PMULL disappears entirely — only two
+    /// PMULLs remain, `lo = a_lo^2`, `hi = a_hi^2`.
+    #[inline(always)]
+    unsafe fn sq_wide(a_lo: u64, a_hi: u64) -> (uint64x2_t, uint64x2_t) {
+        let lo = transmute::<_, uint64x2_t>(vmull_p64(a_lo, a_lo));
+        let hi = transmute::<_, uint64x2_t>(vmull_p64(a_hi, a_hi));
+        (lo, hi)
+    }
+
+    /// Reduce a 256-bit carryless product `lo + hi * x^128` modulo the POLYVAL
+    /// polynomial, entirely in the NEON domain.  Two-step fold, bit-for-bit
+    /// identical to `software::reduce_karatsuba`.
+    ///
+    /// For a 64-bit word `x` at word position `p`, its reduction contribution
+    /// is `clmul(x, C)`: `.lo` lands at word `p+1`, `.hi ^ x` at word `p+2`.
+    #[inline(always)]
+    unsafe fn reduce(lo: uint64x2_t, hi: uint64x2_t) -> uint64x2_t {
+        let zero = vdupq_n_u64(0);
+        let cdup = transmute::<uint64x2_t, poly64x2_t>(vdupq_n_u64(C));
+
+        // Fold L0 (lo.lane0): read it with PMULL2 off a lane-swapped copy so the
+        // whole fold stays in NEON (no GPR round-trip on the latency path).
+        let lo_sw = vextq_u64::<1>(lo, lo); // (L1, L0)
+        let p0 = transmute::<_, uint64x2_t>(vmull_high_p64(transmute(lo_sw), cdup));
+        let lo = veorq_u64(lo, vextq_u64::<1>(zero, p0)); // lo.lane1 ^= p0.lo
+        let hi = xor3(hi, vextq_u64::<1>(p0, zero), vzip1q_u64(lo, zero));
+
+        // Fold w1 (lo.lane1), reading lane 1 directly via PMULL2.
+        let p1 = transmute::<_, uint64x2_t>(vmull_high_p64(transmute(lo), cdup));
+        let hi = xor3(hi, p1, vzip2q_u64(zero, lo));
+        hi
+    }
 
     #[inline]
     #[target_feature(enable = "aes")]
     pub unsafe fn mul_128(a: u128, b: u128) -> u128 {
-        let a_lo = a as u64;
-        let a_hi = (a >> 64) as u64;
-        let b_lo = b as u64;
-        let b_hi = (b >> 64) as u64;
-
-        // Karatsuba 64x64 -> 128 carryless products: z0, z1, and the middle
-        // term z2 = clmul(a_lo^a_hi, b_lo^b_hi) ^ z0 ^ z1.
-        let z0 = core::mem::transmute::<_, uint64x2_t>(vmull_p64(a_lo, b_lo));
-        let z1 = core::mem::transmute::<_, uint64x2_t>(vmull_p64(a_hi, b_hi));
-        let mid = core::mem::transmute::<_, uint64x2_t>(vmull_p64(a_lo ^ a_hi, b_lo ^ b_hi));
-        let z2 = veorq_u64(mid, veorq_u64(z0, z1));
-
-        // The 256-bit product as four 64-bit words (L0,L1,L2,L3), low to high:
-        //   lo = (L0, L1) = z0 ^ (0, z2.lo)
-        //   hi = (L2, L3) = z1 ^ (z2.hi, 0)
-        let zero = vdupq_n_u64(0);
-        let lo = veorq_u64(z0, vextq_u64::<1>(zero, z2));
-        let hi = veorq_u64(z1, vextq_u64::<1>(z2, zero));
-
-        // Fold the low half into the high half.  For a 64-bit word x, its
-        // reduction contribution is the carryless product clmul(x, C) where
-        // C = 0xC200000000000000 is the POLYVAL reduction constant in the
-        // reversed (POLYVAL) bit order (the *forward*-order 0x87 the old code
-        // used is GHASH's constant and a different field).  Folding a word at
-        // word-position p adds clmul(x,C).lo at p+1 and clmul(x,C).hi ^ x at
-        // p+2.  This matches `software::reduce_karatsuba` exactly.
-        const C: u64 = 0xC200_0000_0000_0000;
-        let cdup = core::mem::transmute::<uint64x2_t, poly64x2_t>(vdupq_n_u64(C));
-
-        // Fold L0 (lo.lane0): lo.lane1 ^= p0.lo (-> w1); hi.lane0 ^= p0.hi ^ L0.
-        // Read L0 with PMULL2 off a lane-swapped copy so the whole fold stays
-        // in the NEON domain (no GPR round-trip on the latency path).
-        let lo_sw = vextq_u64::<1>(lo, lo); // (L1, L0)
-        let p0 = core::mem::transmute::<_, uint64x2_t>(vmull_high_p64(
-            core::mem::transmute::<uint64x2_t, poly64x2_t>(lo_sw),
-            cdup,
-        ));
-        let lo = veorq_u64(lo, vextq_u64::<1>(zero, p0));
-        let hi = veorq_u64(hi, veorq_u64(vextq_u64::<1>(p0, zero), vzip1q_u64(lo, zero)));
-
-        // Fold w1 (lo.lane1) with PMULL2, reading lane 1 directly (no GPR
-        // round-trip): hi.lane0 ^= p1.lo; hi.lane1 ^= p1.hi ^ w1.
-        let p1 = core::mem::transmute::<_, uint64x2_t>(vmull_high_p64(
-            core::mem::transmute::<uint64x2_t, poly64x2_t>(lo),
-            cdup,
-        ));
-        let hi = veorq_u64(hi, veorq_u64(p1, vzip2q_u64(zero, lo)));
-
-        core::mem::transmute::<uint64x2_t, u128>(hi)
+        let (lo, hi) = clmul_wide(a as u64, (a >> 64) as u64, b as u64, (b >> 64) as u64);
+        transmute::<uint64x2_t, u128>(reduce(lo, hi))
     }
+
+    /// `a * a` using the two-PMULL squaring specialisation.
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub unsafe fn square_128(a: u128) -> u128 {
+        let (lo, hi) = sq_wide(a as u64, (a >> 64) as u64);
+        transmute::<uint64x2_t, u128>(reduce(lo, hi))
+    }
+
+    /// Deferred-reduction dot product: `reduce(sum_i a_i * b_i)`.  The 256-bit
+    /// accumulator lives in two NEON registers across the whole loop and the
+    /// expensive reduction runs exactly once at the end.  Two independent
+    /// accumulator lanes hide PMULL latency.  `a` and `b` must be equal length.
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub unsafe fn dot_product(a: &[u128], b: &[u128]) -> u128 {
+        let n = a.len();
+        let mut lo0 = vdupq_n_u64(0);
+        let mut hi0 = vdupq_n_u64(0);
+        let mut lo1 = vdupq_n_u64(0);
+        let mut hi1 = vdupq_n_u64(0);
+
+        let mut i = 0;
+        while i + 2 <= n {
+            let (l0, h0) =
+                clmul_wide(a[i] as u64, (a[i] >> 64) as u64, b[i] as u64, (b[i] >> 64) as u64);
+            let (l1, h1) = clmul_wide(
+                a[i + 1] as u64,
+                (a[i + 1] >> 64) as u64,
+                b[i + 1] as u64,
+                (b[i + 1] >> 64) as u64,
+            );
+            lo0 = veorq_u64(lo0, l0);
+            hi0 = veorq_u64(hi0, h0);
+            lo1 = veorq_u64(lo1, l1);
+            hi1 = veorq_u64(hi1, h1);
+            i += 2;
+        }
+        if i < n {
+            let (l0, h0) =
+                clmul_wide(a[i] as u64, (a[i] >> 64) as u64, b[i] as u64, (b[i] >> 64) as u64);
+            lo0 = veorq_u64(lo0, l0);
+            hi0 = veorq_u64(hi0, h0);
+        }
+        let lo = veorq_u64(lo0, lo1);
+        let hi = veorq_u64(hi0, hi1);
+        transmute::<uint64x2_t, u128>(reduce(lo, hi))
+    }
+
+    /// Single unreduced multiply-accumulate step for `F128Acc`: returns the
+    /// product's two 256-bit halves as u128s to be XORed into a caller-held
+    /// accumulator.
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub unsafe fn acc_mul(a: u128, b: u128) -> (u128, u128) {
+        let (lo, hi) = clmul_wide(a as u64, (a >> 64) as u64, b as u64, (b >> 64) as u64);
+        (transmute::<uint64x2_t, u128>(lo), transmute::<uint64x2_t, u128>(hi))
+    }
+
+    /// Final reduction of an accumulated 256-bit `(lo, hi)` value.
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub unsafe fn acc_reduce(lo: u128, hi: u128) -> u128 {
+        transmute::<uint64x2_t, u128>(reduce(transmute(lo), transmute(hi)))
+    }
+
 }
 
 mod software {
@@ -387,4 +634,123 @@ mod software {
 #[cfg(test)]
 pub(crate) fn mul_reference_bitserial(a: u128, b: u128) -> u128 {
     software::mul_128_bitserial(a, b)
+}
+
+#[cfg(test)]
+mod ext_tests {
+    use super::*;
+
+    /// Cheap deterministic PRNG (splitmix64) producing full 128-bit values.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn next_u128(&mut self) -> u128 {
+            (self.next_u64() as u128) | ((self.next_u64() as u128) << 64)
+        }
+        fn next_f128(&mut self) -> F128 {
+            F128::from_raw(self.next_u128())
+        }
+    }
+
+    /// Reference field multiply via the bit-serial oracle.
+    fn ref_mul(a: F128, b: F128) -> F128 {
+        F128::from_raw(mul_reference_bitserial(a.raw(), b.raw()))
+    }
+
+    /// Naive inverse (127 squarings + 127 multiplies), the previous algorithm,
+    /// used as an independent oracle for the addition-chain inverse.
+    fn ref_inverse(a: F128) -> F128 {
+        let mut x = a;
+        let mut out = F128::ONE;
+        for _ in 1..128 {
+            x = x * x;
+            out = out * x;
+        }
+        out
+    }
+
+    #[test]
+    fn square_matches_oracle() {
+        let mut rng = Rng(0x1234_5678);
+        for _ in 0..20_000 {
+            let a = rng.next_f128();
+            assert_eq!(a.square(), ref_mul(a, a));
+            assert_eq!(a.square(), a * a);
+        }
+        assert_eq!(F128::ZERO.square(), F128::ZERO);
+        assert_eq!(F128::ONE.square(), F128::ONE);
+    }
+
+    #[test]
+    fn inverse_matches_oracle_and_is_inverse() {
+        let mut rng = Rng(0xDEAD_BEEF);
+        for _ in 0..20_000 {
+            let a = rng.next_f128();
+            if a == F128::ZERO {
+                continue;
+            }
+            let inv = a.inverse();
+            assert_eq!(inv, ref_inverse(a));
+            assert_eq!(a * inv, F128::ONE);
+        }
+        assert_eq!(F128::ONE.inverse(), F128::ONE);
+    }
+
+    #[test]
+    fn dot_product_and_accumulator_match_oracle() {
+        let mut rng = Rng(0x0F0F_5A5A);
+        for len in [0usize, 1, 2, 3, 4, 5, 8, 9, 16, 31, 64, 129] {
+            for _ in 0..64 {
+                let a: Vec<F128> = (0..len).map(|_| rng.next_f128()).collect();
+                let b: Vec<F128> = (0..len).map(|_| rng.next_f128()).collect();
+
+                // Oracle: fold of independent reference multiplies.
+                let mut want = F128::ZERO;
+                for i in 0..len {
+                    want += ref_mul(a[i], b[i]);
+                }
+
+                assert_eq!(F128::dot_product(&a, &b), want, "dot len={len}");
+
+                // F128Acc via per-element accumulate.
+                let mut acc2 = F128Acc::ZERO;
+                for i in 0..len {
+                    acc2.accumulate(a[i], b[i]);
+                }
+                assert_eq!(acc2.finalize(), want, "accumulate len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn accumulator_combine_is_linear() {
+        let mut rng = Rng(0x7777_3333);
+        for _ in 0..2_000 {
+            let n = 10;
+            let a: Vec<F128> = (0..n).map(|_| rng.next_f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.next_f128()).collect();
+            let mut want = F128::ZERO;
+            for i in 0..n {
+                want += ref_mul(a[i], b[i]);
+            }
+            // Split the work across two accumulators, then combine.
+            let mut acc_a = F128Acc::new();
+            let mut acc_b = F128Acc::new();
+            for i in 0..n {
+                if i % 2 == 0 {
+                    acc_a.accumulate(a[i], b[i]);
+                } else {
+                    acc_b.accumulate(a[i], b[i]);
+                }
+            }
+            acc_a.combine(&acc_b);
+            assert_eq!(acc_a.finalize(), want);
+        }
+    }
 }
