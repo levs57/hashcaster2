@@ -1,9 +1,19 @@
 use crate::boolpoly::{self, BoolPoly};
 use crate::challenger::{Challenger, FsChallenger, ProofReader, ProofTranscript, ProofWriter};
+use crate::chi_round::{
+    prover::{ProverCfg, ProverScratch},
+    verifier::{HybridClaim, VerifierCfg},
+};
 use crate::field::{self, F128};
+use crate::linrounds::{
+    self,
+    prover::ProverCfg as LinroundProverCfg,
+    verifier::VerifierCfg as LinroundVerifierCfg,
+    Linround,
+};
 use crate::matrix::{BooleanMatrix, FourRussians128, FourRussians256, PACKED_U64S};
-use crate::protocol_state::{self, ProtocolState};
-use crate::rmfe;
+use crate::protocol_state::{self, KeccakWitness, ProtocolState};
+use crate::{rmfe, util};
 
 #[test]
 fn field_basics() {
@@ -201,8 +211,29 @@ fn packed_keccak_witness_matches_scalar_keccak() {
     protocol.generate_keccak();
     assert_eq!(protocol.witness.input(), &initial);
 
-    for state in &mut scalar_states {
-        protocol_state::keccak_f_lanes(state);
+    let mut pre_chi_trace =
+        [[[0u64; protocol_state::KECCAK_LANES]; protocol_state::KECCAK_ROUNDS];
+            protocol_state::PACKED_KECCAKS];
+    for (instance, state) in scalar_states.iter_mut().enumerate() {
+        protocol_state::keccak_f_lanes_with_pre_chi(state, &mut pre_chi_trace[instance]);
+    }
+
+    for instance in 0..protocol_state::PACKED_KECCAKS {
+        for round in 0..protocol_state::KECCAK_ROUNDS {
+            for y in 0..5 {
+                for x in 0..5 {
+                    let lane = pre_chi_trace[instance][round][x + 5 * y];
+                    for z in 0..64 {
+                        let packed = protocol.witness.pre_chi_word(0, round, x, y, z);
+                        assert_eq!(
+                            ((packed >> instance) & 1) as u64,
+                            (lane >> z) & 1,
+                            "pre-chi round {round}, instance {instance}, lane ({x}, {y}), bit {z}",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     let final_state = protocol.witness.output();
@@ -219,6 +250,253 @@ fn packed_keccak_witness_matches_scalar_keccak() {
                     );
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn chi_round_prover_passes_verifier_on_zero_witness() {
+    let witness = ProtocolState::new_blocks(1, 1).witness;
+    let claim = HybridClaim {
+        t: F128::from_raw(17),
+        r_x: vec![F128::from_raw(3), F128::from_raw(5), F128::from_raw(7)],
+        r_y: vec![F128::from_raw(11), F128::from_raw(13), F128::from_raw(19)],
+        r_z: vec![
+            F128::from_raw(23),
+            F128::from_raw(29),
+            F128::from_raw(31),
+            F128::from_raw(37),
+            F128::from_raw(41),
+            F128::from_raw(43),
+        ],
+        r_out: Vec::new(),
+        ev: F128::ZERO,
+    };
+    let prover_cfg = ProverCfg {
+        log_packed_instances: 0,
+        round: 0,
+    };
+    let verifier_cfg = VerifierCfg {
+        log_packed_instances: 0,
+    };
+
+    let mut scratch = ProverScratch::new(0);
+    let mut writer = ProofWriter::new(FsChallenger::new(b"chi-zero"));
+    let expected = prover_cfg.prove(&mut writer, &witness, claim.clone(), &mut scratch);
+    let proof = writer.into_proof();
+
+    let mut reader = ProofReader::new(FsChallenger::new(b"chi-zero"), proof);
+    let actual = verifier_cfg.verify(&mut reader, claim).unwrap();
+    reader.finish().unwrap();
+    assert_eq!(actual.t, expected.claim.t);
+    assert_eq!(actual.ev, expected.claim.ev);
+    assert_eq!(actual.r_x, expected.claim.r_x);
+    assert_eq!(actual.r_y, expected.claim.r_y);
+    assert_eq!(actual.r_z, expected.claim.r_z);
+    assert_eq!(actual.r_out, expected.claim.r_out);
+}
+
+#[test]
+fn chi_round_prover_passes_verifier_with_virtual_padding() {
+    let mut protocol = ProtocolState::new_blocks(1, 1);
+    protocol.witness.set_pre_chi_word(0, 0, 1, 0, 0, 1);
+    protocol.witness.set_pre_chi_word(0, 0, 2, 0, 0, 1);
+
+    let mut claim = HybridClaim {
+        t: F128::from_raw(17),
+        r_x: vec![F128::from_raw(3), F128::from_raw(5), F128::from_raw(7)],
+        r_y: vec![F128::from_raw(11), F128::from_raw(13), F128::from_raw(19)],
+        r_z: vec![
+            F128::from_raw(23),
+            F128::from_raw(29),
+            F128::from_raw(31),
+            F128::from_raw(37),
+            F128::from_raw(41),
+            F128::from_raw(43),
+        ],
+        r_out: vec![F128::from_raw(47)],
+        ev: F128::ZERO,
+    };
+    let prover_cfg = ProverCfg {
+        log_packed_instances: 1,
+        round: 0,
+    };
+    let verifier_cfg = VerifierCfg {
+        log_packed_instances: 1,
+    };
+
+    let mut scratch = ProverScratch::new(1);
+    claim.ev = slow_chi_initial_claim(&protocol.witness, 0, 1, &claim);
+    let mut writer = ProofWriter::new(FsChallenger::new(b"chi-padding"));
+    let expected = prover_cfg.prove(&mut writer, &protocol.witness, claim.clone(), &mut scratch);
+    let proof = writer.into_proof();
+
+    let mut reader = ProofReader::new(FsChallenger::new(b"chi-padding"), proof);
+    let actual = verifier_cfg.verify(&mut reader, claim).unwrap();
+    reader.finish().unwrap();
+    assert_eq!(actual.t, expected.claim.t);
+    assert_eq!(actual.ev, expected.claim.ev);
+    assert_eq!(actual.r_x, expected.claim.r_x);
+    assert_eq!(actual.r_y, expected.claim.r_y);
+    assert_eq!(actual.r_z, expected.claim.r_z);
+    assert_eq!(actual.r_out, expected.claim.r_out);
+}
+
+#[test]
+fn linround_prover_passes_verifier() {
+    for round in [Linround::Theta, Linround::RhoPi, Linround::ThetaRhoPi] {
+        let mut input = [F128::ZERO; protocol_state::KECCAK_BITS];
+        for x in 0..5 {
+            for y in 0..5 {
+                for z in 0..64 {
+                    let idx = protocol_state::state_idx(x, y, z);
+                    input[idx] = F128::from_raw((idx as u128 + 1).wrapping_mul(17));
+                }
+            }
+        }
+
+        let mut output = [F128::ZERO; protocol_state::KECCAK_BITS];
+        linrounds::apply(round, &input, &mut output);
+
+        let mut claim = HybridClaim {
+            t: F128::from_raw(17),
+            r_x: vec![F128::from_raw(3), F128::from_raw(5), F128::from_raw(7)],
+            r_y: vec![F128::from_raw(11), F128::from_raw(13), F128::from_raw(19)],
+            r_z: vec![
+                F128::from_raw(23),
+                F128::from_raw(29),
+                F128::from_raw(31),
+                F128::from_raw(37),
+                F128::from_raw(41),
+                F128::from_raw(43),
+            ],
+            r_out: vec![F128::from_raw(47), F128::from_raw(53)],
+            ev: F128::ZERO,
+        };
+        claim.ev = physical_state_eval(&output, &claim.r_x, &claim.r_y, &claim.r_z);
+
+        let mut writer = ProofWriter::new(FsChallenger::new(b"linround-test"));
+        let expected = LinroundProverCfg { round }.prove(&mut writer, claim.clone(), &input);
+        let proof = writer.into_proof();
+        let mut reader = ProofReader::new(FsChallenger::new(b"linround-test"), proof);
+        let actual = LinroundVerifierCfg { round }
+            .verify(&mut reader, claim)
+            .expect("linround verifier");
+        reader.finish().expect("proof consumed");
+
+        assert_eq!(actual.ev, expected.ev);
+        assert_eq!(actual.r_x, expected.r_x);
+        assert_eq!(actual.r_y, expected.r_y);
+        assert_eq!(actual.r_z, expected.r_z);
+    }
+}
+
+#[test]
+fn linround_inverse_roundtrip() {
+    for round in [Linround::Theta, Linround::RhoPi, Linround::ThetaRhoPi] {
+        let mut input = [F128::ZERO; protocol_state::KECCAK_BITS];
+        for idx in 0..protocol_state::KECCAK_BITS {
+            input[idx] = F128::from_raw((idx as u128 + 13).wrapping_mul(0x101));
+        }
+
+        let mut image = [F128::ZERO; protocol_state::KECCAK_BITS];
+        linrounds::apply(round, &input, &mut image);
+
+        let mut recovered = [F128::ZERO; protocol_state::KECCAK_BITS];
+        linrounds::apply_inverse(round, &image, &mut recovered);
+        assert_eq!(recovered, input);
+    }
+}
+
+fn slow_chi_initial_claim(
+    witness: &KeccakWitness,
+    round: usize,
+    log_packed_instances: usize,
+    claim: &HybridClaim,
+) -> F128 {
+    let eq_x = util::eq_poly_v(&claim.r_x);
+    let eq_y = util::eq_poly_v(&claim.r_y);
+    let eq_z = util::eq_poly_v(&claim.r_z);
+    let eq_out = util::eq_poly_v(&claim.r_out);
+    let one = slow_embed_word((1u128 << rmfe::RMFE_BITS) - 1);
+    let mut u = vec![F128::ZERO; rmfe::PRODUCT_BITS];
+
+    for out in 0..(1usize << log_packed_instances) {
+        for y in 0..5 {
+            for z in 0..64 {
+                let eq_yzout = eq_out[out] * eq_y[y] * eq_z[z];
+                for x in 0..5 {
+                    let scalar = eq_yzout * eq_x[x];
+                    let left = slow_embed_word(slow_state_word(
+                        witness,
+                        round,
+                        out,
+                        (x + 1) % 5,
+                        y,
+                        z,
+                    ));
+                    let right = slow_embed_word(slow_state_word(
+                        witness,
+                        round,
+                        out,
+                        (x + 2) % 5,
+                        y,
+                        z,
+                    ));
+                    let center = slow_embed_word(slow_state_word(witness, round, out, x, y, z));
+                    slow_add_product(&mut u, &left, &right, scalar);
+                    slow_add_product(&mut u, &center, &one, scalar);
+                    slow_add_product(&mut u, &right, &one, scalar);
+                }
+            }
+        }
+    }
+
+    let projected = util::apply_boolean_matrix(rmfe::projection_matrix(), &u);
+    util::evaluate_univar(&projected, claim.t)
+}
+
+fn slow_state_word(
+    witness: &KeccakWitness,
+    round: usize,
+    out: usize,
+    x: usize,
+    y: usize,
+    z: usize,
+) -> u128 {
+    if out < witness.blocks() {
+        witness.pre_chi_word(out, round, x, y, z)
+    } else {
+        protocol_state::zero_pre_chi_word(round, x, y, z)
+    }
+}
+
+fn slow_embed_word(word: u128) -> [F128; rmfe::PRODUCT_DEGREE] {
+    let bits: [F128; rmfe::RMFE_BITS] = core::array::from_fn(|bit| {
+        if ((word >> bit) & 1) == 0 {
+            F128::ZERO
+        } else {
+            F128::ONE
+        }
+    });
+    util::apply_boolean_matrix(rmfe::embedding_matrix(), &bits)
+}
+
+fn slow_add_product(
+    out: &mut [F128],
+    lhs: &[F128; rmfe::PRODUCT_DEGREE],
+    rhs: &[F128; rmfe::PRODUCT_DEGREE],
+    scalar: F128,
+) {
+    if scalar == F128::ZERO {
+        return;
+    }
+    for i in 0..rmfe::PRODUCT_DEGREE {
+        if lhs[i] == F128::ZERO {
+            continue;
+        }
+        for j in 0..rmfe::PRODUCT_DEGREE {
+            out[i + j] += lhs[i] * rhs[j] * scalar;
         }
     }
 }
@@ -298,6 +576,22 @@ fn xor_packed_block(out: &mut [u64], rhs: &[u64]) {
     for idx in 0..PACKED_U64S {
         out[idx] ^= rhs[idx];
     }
+}
+
+fn physical_state_eval(state: &[F128], r_x: &[F128], r_y: &[F128], r_z: &[F128]) -> F128 {
+    let eq_x = util::eq_poly_v(r_x);
+    let eq_y = util::eq_poly_v(r_y);
+    let eq_z = util::eq_poly_v(r_z);
+    let mut out = F128::ZERO;
+    for x in 0..5 {
+        for y in 0..5 {
+            let xy = eq_x[x] * eq_y[y];
+            for z in 0..64 {
+                out += xy * eq_z[z] * state[protocol_state::state_idx(x, y, z)];
+            }
+        }
+    }
+    out
 }
 
 fn apply_embedding_matrix(word: u128) -> BoolPoly {

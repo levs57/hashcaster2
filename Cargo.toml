@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 blake3 = "1.5"
+rayon = "1.10"
 sha2 = "0.10"
 
 [features]

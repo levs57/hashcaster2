@@ -43,6 +43,11 @@ impl BoolPoly {
     }
 
     #[inline]
+    pub fn is_zero(self) -> bool {
+        self.limbs.iter().all(|&limb| limb == 0)
+    }
+
+    #[inline]
     pub fn xor(self, rhs: Self) -> Self {
         Self {
             limbs: [
@@ -94,12 +99,46 @@ impl WideBoolPoly {
     pub fn degree(self) -> Option<usize> {
         wide_degree(self)
     }
+
+    #[inline]
+    pub fn is_zero(self) -> bool {
+        self.limbs.iter().all(|&limb| limb == 0)
+    }
+}
+
+impl std::ops::BitXor for WideBoolPoly {
+    type Output = Self;
+
+    #[inline(always)]
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        let lhs = self.limbs;
+        let rhs = rhs.limbs;
+        Self {
+            limbs: [
+                lhs[0] ^ rhs[0],
+                lhs[1] ^ rhs[1],
+                lhs[2] ^ rhs[2],
+                lhs[3] ^ rhs[3],
+                lhs[4] ^ rhs[4],
+                lhs[5] ^ rhs[5],
+            ],
+        }
+    }
+}
+
+impl std::ops::BitXorAssign for WideBoolPoly {
+    #[inline(always)]
+    fn bitxor_assign(&mut self, rhs: Self) {
+        for idx in 0..6 {
+            self.limbs[idx] ^= rhs.limbs[idx];
+        }
+    }
 }
 
 pub fn clmul_192(lhs: BoolPoly, rhs: BoolPoly) -> WideBoolPoly {
     let lhs = lhs.limbs();
     let rhs = rhs.limbs();
-    let mut out = WideBoolPoly::ZERO;
+    let mut out = [0u64; 6];
     for i in 0..3 {
         for j in 0..3 {
             let a = lhs[i];
@@ -107,10 +146,12 @@ pub fn clmul_192(lhs: BoolPoly, rhs: BoolPoly) -> WideBoolPoly {
             if a == 0 || b == 0 {
                 continue;
             }
-            xor_shifted_wide(&mut out, clmul_64(a, b), 64 * (i + j));
+            let product = clmul_64(a, b);
+            out[i + j] ^= product as u64;
+            out[i + j + 1] ^= (product >> 64) as u64;
         }
     }
-    out
+    WideBoolPoly::from_limbs(out)
 }
 
 pub(crate) fn mul_small(lhs: BoolPoly, rhs: u16) -> BoolPoly {
@@ -233,22 +274,6 @@ fn xor_shifted(out: &mut BoolPoly, value: BoolPoly, shift: usize) {
     *out = BoolPoly::from_limbs(out_limbs);
 }
 
-fn xor_shifted_wide(out: &mut WideBoolPoly, value: u128, shift: usize) {
-    let limb_shift = shift / 64;
-    let bit_shift = shift % 64;
-    let limbs = [value as u64, (value >> 64) as u64];
-    for idx in 0..2 {
-        let limb = limbs[idx];
-        if limb == 0 || idx + limb_shift >= 6 {
-            continue;
-        }
-        out.limbs[idx + limb_shift] ^= limb << bit_shift;
-        if bit_shift != 0 && idx + limb_shift + 1 < 6 {
-            out.limbs[idx + limb_shift + 1] ^= limb >> (64 - bit_shift);
-        }
-    }
-}
-
 fn xor_shifted_wide_poly(out: &mut WideBoolPoly, value: BoolPoly, shift: usize) {
     let limbs = value.limbs();
     let limb_shift = shift / 64;
@@ -266,6 +291,16 @@ fn xor_shifted_wide_poly(out: &mut WideBoolPoly, value: BoolPoly, shift: usize) 
 }
 
 fn clmul_64(lhs: u64, rhs: u64) -> u128 {
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "pclmulqdq"
+    ))]
+    unsafe {
+        return clmul_64_x86(lhs, rhs);
+    }
+
+    #[allow(unreachable_code)]
+    {
     let mut out = 0u128;
     let mut bits = rhs;
     while bits != 0 {
@@ -274,6 +309,29 @@ fn clmul_64(lhs: u64, rhs: u64) -> u128 {
         bits &= bits - 1;
     }
     out
+    }
+}
+
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "pclmulqdq"
+))]
+#[inline(always)]
+unsafe fn clmul_64_x86(lhs: u64, rhs: u64) -> u128 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{_mm_clmulepi64_si128, _mm_set_epi64x};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{_mm_clmulepi64_si128, _mm_set_epi64x};
+
+    let product = unsafe {
+        _mm_clmulepi64_si128(
+            _mm_set_epi64x(0, lhs as i64),
+            _mm_set_epi64x(0, rhs as i64),
+            0x00,
+        )
+    };
+    let limbs: [u64; 2] = unsafe { core::mem::transmute(product) };
+    (limbs[0] as u128) | ((limbs[1] as u128) << 64)
 }
 
 fn poly_mul_u16(lhs: u16, rhs: u16) -> u32 {
