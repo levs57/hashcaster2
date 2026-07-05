@@ -236,6 +236,9 @@ fn generate_blocks(
     let blocks = input.len() / KECCAK_BITS;
     assert_eq!(input.len(), blocks * KECCAK_BITS);
     assert_eq!(output.len(), blocks * KECCAK_BITS);
+    // rho_pi fully overwrites this scratch every round, so it never needs
+    // re-zeroing; allocate once per worker call instead of once per round.
+    let mut pre_chi = vec![0u128; KECCAK_BITS].into_boxed_slice();
     for block in 0..blocks {
         let global_block = start_block + block;
         let input = &input[block * KECCAK_BITS..][..KECCAK_BITS];
@@ -245,7 +248,6 @@ fn generate_blocks(
 
         for round in 0..KECCAK_ROUNDS {
             theta_packed(current);
-            let mut pre_chi = [0u128; KECCAK_BITS];
             rho_pi_packed(current, &mut pre_chi);
             write_pre_chi_block(pre_chi_ptr, total_blocks, global_block, round, &pre_chi);
             chi_iota_packed(&pre_chi, current, round);
@@ -264,17 +266,27 @@ fn write_pre_chi_block(
     blocks: usize,
     block: usize,
     round: usize,
-    state: &[u128; KECCAK_BITS],
+    state: &[u128],
 ) {
+    // Destination layout is (round, y, z, block, x): the five x words for a
+    // fixed (round, y, z, block) are contiguous, and each y advances by
+    // 64 * blocks * 5 words. Walk the source in (y, z, x) order so the loads
+    // stay sequential-ish and the stores hit five contiguous slots at a time.
+    let round_base = round * blocks * KECCAK_BITS;
+    let block_x = block * 5;
     for y in 0..5 {
+        let src_y = y * 5 * 64; // state_idx(0, y, 0)
+        let dst_y = round_base + (y * 64) * blocks * 5 + block_x;
         for z in 0..64 {
-            for x in 0..5 {
-                let dst = pre_chi_idx(blocks, block, round, x, y, z);
-                let src = state_idx(x, y, z);
-                // Workers write disjoint block positions inside each strip.
-                unsafe {
-                    *pre_chi.0.add(dst) = state[src];
-                }
+            let src = src_y + z; // state_idx(0, y, z) with stride 64 over x
+            let dst = dst_y + z * blocks * 5;
+            unsafe {
+                let d = pre_chi.0.add(dst);
+                *d = *state.get_unchecked(src);
+                *d.add(1) = *state.get_unchecked(src + 64);
+                *d.add(2) = *state.get_unchecked(src + 128);
+                *d.add(3) = *state.get_unchecked(src + 192);
+                *d.add(4) = *state.get_unchecked(src + 256);
             }
         }
     }
@@ -288,7 +300,128 @@ fn zero_boxed_states(blocks: usize) -> Box<[u128]> {
     vec![0u128; blocks * KECCAK_BITS].into_boxed_slice()
 }
 
+#[inline]
 fn theta_packed(state: &mut [u128]) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    unsafe {
+        theta_packed_neon(state);
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
+    theta_packed_scalar(state);
+}
+
+#[inline]
+fn rho_pi_packed(input: &[u128], output: &mut [u128]) {
+    // rho+pi is a pure permutation with a per-lane cyclic rotation over z.
+    // Each destination lane is contiguous in z, so express the rotation as two
+    // contiguous slice copies instead of an element-wise gather.
+    for y in 0..5 {
+        for x in 0..5 {
+            let a = (x + 3 * y) % 5;
+            let b = x;
+            let r = RHO_OFFSETS[a][b] as usize;
+            let in_base = (a + 5 * b) * 64; // state_idx(a, b, 0)
+            let out_base = (x + 5 * y) * 64; // state_idx(x, y, 0)
+            let src = &input[in_base..in_base + 64];
+            let dst = &mut output[out_base..out_base + 64];
+            if r == 0 {
+                dst.copy_from_slice(src);
+            } else {
+                // output[z] = input[(z + 64 - r) % 64]
+                dst[..r].copy_from_slice(&src[64 - r..]);
+                dst[r..].copy_from_slice(&src[..64 - r]);
+            }
+        }
+    }
+}
+
+#[inline]
+fn chi_iota_packed(pre_chi: &[u128], output: &mut [u128], round: usize) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    unsafe {
+        chi_iota_packed_neon(pre_chi, output, round);
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
+    chi_iota_packed_scalar(pre_chi, output, round);
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[target_feature(enable = "sha3")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn theta_packed_neon(state: &mut [u128]) {
+    use core::arch::aarch64::*;
+    let base = state.as_mut_ptr();
+    // c[x][z] = xor over y of state[x, y, z]. Two 3-way EOR3 collapse the
+    // five-term parity into two instructions per column.
+    let mut c = [[vdupq_n_u64(0); LANE_BITS]; 5];
+    for x in 0..5 {
+        let col = &mut c[x];
+        for z in 0..LANE_BITS {
+            let p = base.add(state_idx(x, 0, z)) as *const u64;
+            let s0 = vld1q_u64(p);
+            let s1 = vld1q_u64(p.add(2 * 5 * 64)); // + one y row (5*64 u128 = 2*.. u64)
+            let s2 = vld1q_u64(p.add(2 * 2 * 5 * 64));
+            let s3 = vld1q_u64(p.add(2 * 3 * 5 * 64));
+            let s4 = vld1q_u64(p.add(2 * 4 * 5 * 64));
+            col[z] = veor3q_u64(veor3q_u64(s0, s1, s2), s3, s4);
+        }
+    }
+
+    // state[x, y, z] ^= c[(x+4)%5][z] ^ c[(x+1)%5][(z+63)%64], fused as EOR3.
+    for y in 0..5 {
+        for x in 0..5 {
+            let xm = (x + 4) % 5;
+            let xp = (x + 1) % 5;
+            let cm = &c[xm];
+            let cp = &c[xp];
+            for z in 0..LANE_BITS {
+                let idx = state_idx(x, y, z);
+                let p = base.add(idx) as *mut u64;
+                let sv = vld1q_u64(p);
+                let ca = cm[z];
+                let cb = cp[(z + 63) % 64];
+                vst1q_u64(p, veor3q_u64(sv, ca, cb));
+            }
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[target_feature(enable = "sha3")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn chi_iota_packed_neon(pre_chi: &[u128], output: &mut [u128], round: usize) {
+    use core::arch::aarch64::*;
+    let src = pre_chi.as_ptr();
+    let dst = output.as_mut_ptr();
+    // chi: out = a ^ ((!b) & c). BCAX computes a ^ (b & !c) directly, so pass
+    // (a, c, b). Inputs are 96-bit masked, so !b's high bits are cleared by
+    // & c and the result stays masked without an explicit AND.
+    for y in 0..5 {
+        for x in 0..5 {
+            let x1 = (x + 1) % 5;
+            let x2 = (x + 2) % 5;
+            let pa = src.add(state_idx(x, y, 0)) as *const u64;
+            let pb = src.add(state_idx(x1, y, 0)) as *const u64;
+            let pc = src.add(state_idx(x2, y, 0)) as *const u64;
+            let po = dst.add(state_idx(x, y, 0)) as *mut u64;
+            for z in 0..LANE_BITS {
+                let a = vld1q_u64(pa.add(2 * z));
+                let b = vld1q_u64(pb.add(2 * z));
+                let cc = vld1q_u64(pc.add(2 * z));
+                vst1q_u64(po.add(2 * z), vbcaxq_u64(a, cc, b));
+            }
+        }
+    }
+    let rc = ROUND_CONSTANTS[round];
+    for z in 0..LANE_BITS {
+        if ((rc >> z) & 1) != 0 {
+            output[state_idx(0, 0, z)] ^= PACKED_MASK;
+        }
+    }
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
+fn theta_packed_scalar(state: &mut [u128]) {
     let mut c = [[0u128; LANE_BITS]; 5];
     for x in 0..5 {
         for z in 0..LANE_BITS {
@@ -316,20 +449,8 @@ fn theta_packed(state: &mut [u128]) {
     }
 }
 
-fn rho_pi_packed(input: &[u128], output: &mut [u128]) {
-    for y in 0..5 {
-        for x in 0..5 {
-            let a = (x + 3 * y) % 5;
-            let b = x;
-            let r = RHO_OFFSETS[a][b] as usize;
-            for z in 0..LANE_BITS {
-                output[state_idx(x, y, z)] = input[state_idx(a, b, (z + 64 - r) % 64)];
-            }
-        }
-    }
-}
-
-fn chi_iota_packed(pre_chi: &[u128], output: &mut [u128], round: usize) {
+#[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
+fn chi_iota_packed_scalar(pre_chi: &[u128], output: &mut [u128], round: usize) {
     for y in 0..5 {
         for x in 0..5 {
             for z in 0..LANE_BITS {
@@ -454,4 +575,76 @@ pub(crate) fn keccak_f_lanes_with_pre_chi(
 #[cfg(test)]
 fn lane_idx(x: usize, y: usize) -> usize {
     x + 5 * y
+}
+
+#[cfg(test)]
+mod packed_layout_tests {
+    use super::*;
+
+    fn fill_random(input: &mut [u128], seed: u128) {
+        let mut rng = seed | 1;
+        for slot in input.iter_mut() {
+            rng = rng
+                .wrapping_mul(0xda94_2042_e4dd_58b5_94d0_49bb_1331_11eb)
+                .rotate_left(41);
+            let lo = rng as u64 as u128;
+            rng = rng
+                .wrapping_mul(0x2545_f491_4f6c_dd1d_9e37_79b9_7f4a_7c15)
+                .rotate_left(29);
+            let hi = rng as u64 as u128;
+            *slot = (lo | (hi << 64)) & PACKED_MASK;
+        }
+    }
+
+    // The single-block generator is validated bit-for-bit against a scalar
+    // Keccak reference elsewhere; here we check that the multi-block, multi-
+    // worker path (including the transposed pre_chi write and worker split)
+    // reproduces the single-block result for every block, over random inputs.
+    #[test]
+    fn multi_block_matches_single_block() {
+        for &(blocks, workers) in &[(1usize, 1usize), (3, 1), (4, 2), (7, 3), (16, 16), (5, 4)] {
+            let workers = workers.min(blocks);
+            let mut multi = KeccakWitness::new(blocks);
+            let seed = (blocks as u128) << 64 | (workers as u128) | 0x9e37_79b9u128 << 96;
+            fill_random(multi.input_mut(), seed);
+
+            // Reference: run each block on its own single-block witness.
+            let mut singles = Vec::with_capacity(blocks);
+            for block in 0..blocks {
+                let mut single = KeccakWitness::new(1);
+                single
+                    .input_block_mut(0)
+                    .copy_from_slice(multi.input_block(block));
+                let mut scr = ReusableScratches::new(1);
+                single.generate(&mut scr);
+                singles.push(single);
+            }
+
+            let mut scr = ReusableScratches::new(workers);
+            multi.generate(&mut scr);
+
+            for block in 0..blocks {
+                let single = &singles[block];
+                assert_eq!(
+                    multi.output_block(block),
+                    single.output_block(0),
+                    "output mismatch blocks={blocks} workers={workers} block={block}",
+                );
+                for round in 0..KECCAK_ROUNDS {
+                    for x in 0..5 {
+                        for y in 0..5 {
+                            for z in 0..64 {
+                                assert_eq!(
+                                    multi.pre_chi_word(block, round, x, y, z),
+                                    single.pre_chi_word(0, round, x, y, z),
+                                    "pre_chi mismatch blocks={blocks} workers={workers} \
+                                     block={block} round={round} ({x},{y},{z})",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

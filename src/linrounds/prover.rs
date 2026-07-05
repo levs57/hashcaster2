@@ -43,29 +43,36 @@ impl ProverCfg {
         let mut active = LOGICAL_STATE_BITS;
         let mut point = Vec::with_capacity(12);
         for _ in 0..12 {
+            let half = active / 2;
             let mut g1 = F128::ZERO;
             let mut g_inf = F128::ZERO;
-            for idx in 0..active / 2 {
-                let p0 = p[2 * idx];
-                let p1 = p[2 * idx + 1];
-                let q0 = q[2 * idx];
-                let q1 = q[2 * idx + 1];
+            // Chunked over pairs so the compiler keeps the two independent
+            // multiply chains (g1 and g_inf) in flight and elides bounds checks.
+            for (pp, qq) in p[..active]
+                .chunks_exact(2)
+                .zip(q[..active].chunks_exact(2))
+            {
+                let p0 = pp[0];
+                let p1 = pp[1];
+                let q0 = qq[0];
+                let q1 = qq[1];
                 g1 += p1 * q1;
                 g_inf += (p0 + p1) * (q0 + q1);
             }
             ctx.write_f128_slice(&[g1, g_inf]);
 
             let rho = ctx.sample_f128();
-            let one_plus_rho = F128::ONE + rho;
-            for idx in 0..active / 2 {
+            // p0*(1+rho) + p1*rho = p0 + (p0+p1)*rho, halving the field
+            // multiplies in the fold (the dominant cost of this sumcheck).
+            for idx in 0..half {
                 let p0 = p[2 * idx];
                 let p1 = p[2 * idx + 1];
                 let q0 = q[2 * idx];
                 let q1 = q[2 * idx + 1];
-                p[idx] = p0 * one_plus_rho + p1 * rho;
-                q[idx] = q0 * one_plus_rho + q1 * rho;
+                p[idx] = p0 + (p0 + p1) * rho;
+                q[idx] = q0 + (q0 + q1) * rho;
             }
-            active /= 2;
+            active = half;
             point.push(rho);
         }
 
