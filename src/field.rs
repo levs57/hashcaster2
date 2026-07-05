@@ -133,20 +133,6 @@ impl F128Acc {
         self.hi ^= hi;
     }
 
-    /// Fold `sum_i a[i] * b[i]` into the accumulator.  `a` and `b` must be
-    /// equal length.
-    #[inline]
-    pub fn accumulate_dot(&mut self, a: &[F128], b: &[F128]) {
-        assert_eq!(a.len(), b.len());
-        let ar: &[u128] =
-            unsafe { core::slice::from_raw_parts(a.as_ptr() as *const u128, a.len()) };
-        let br: &[u128] =
-            unsafe { core::slice::from_raw_parts(b.as_ptr() as *const u128, b.len()) };
-        let (lo, hi) = ext::acc_dot(ar, br);
-        self.lo ^= lo;
-        self.hi ^= hi;
-    }
-
     /// Merge another accumulator into this one (for parallel reduction: sum
     /// partial accumulators, then finalize once).
     #[inline(always)]
@@ -259,10 +245,6 @@ mod ext {
     pub(super) fn acc_reduce(lo: u128, hi: u128) -> u128 {
         unsafe { aarch64::acc_reduce(lo, hi) }
     }
-    #[inline(always)]
-    pub(super) fn acc_dot(a: &[u128], b: &[u128]) -> (u128, u128) {
-        unsafe { aarch64::dot_wide(a, b) }
-    }
 }
 
 #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
@@ -289,10 +271,6 @@ mod ext {
     #[inline(always)]
     pub(super) fn acc_reduce(lo: u128, _hi: u128) -> u128 {
         lo
-    }
-    #[inline(always)]
-    pub(super) fn acc_dot(a: &[u128], b: &[u128]) -> (u128, u128) {
-        (dot(a, b), 0)
     }
 }
 
@@ -517,44 +495,6 @@ mod aarch64 {
         transmute::<uint64x2_t, u128>(reduce(transmute(lo), transmute(hi)))
     }
 
-    /// Unreduced dot product: `sum_i a_i * b_i` accumulated as a 256-bit
-    /// `(lo, hi)` pair, WITHOUT the final reduction (the caller folds it into a
-    /// deferred accumulator).  `a` and `b` must be equal length.
-    #[inline]
-    #[target_feature(enable = "aes")]
-    pub unsafe fn dot_wide(a: &[u128], b: &[u128]) -> (u128, u128) {
-        let n = a.len();
-        let mut lo0 = vdupq_n_u64(0);
-        let mut hi0 = vdupq_n_u64(0);
-        let mut lo1 = vdupq_n_u64(0);
-        let mut hi1 = vdupq_n_u64(0);
-        let mut i = 0;
-        while i + 2 <= n {
-            let (l0, h0) =
-                clmul_wide(a[i] as u64, (a[i] >> 64) as u64, b[i] as u64, (b[i] >> 64) as u64);
-            let (l1, h1) = clmul_wide(
-                a[i + 1] as u64,
-                (a[i + 1] >> 64) as u64,
-                b[i + 1] as u64,
-                (b[i + 1] >> 64) as u64,
-            );
-            lo0 = veorq_u64(lo0, l0);
-            hi0 = veorq_u64(hi0, h0);
-            lo1 = veorq_u64(lo1, l1);
-            hi1 = veorq_u64(hi1, h1);
-            i += 2;
-        }
-        if i < n {
-            let (l0, h0) =
-                clmul_wide(a[i] as u64, (a[i] >> 64) as u64, b[i] as u64, (b[i] >> 64) as u64);
-            lo0 = veorq_u64(lo0, l0);
-            hi0 = veorq_u64(hi0, h0);
-        }
-        (
-            transmute::<uint64x2_t, u128>(veorq_u64(lo0, lo1)),
-            transmute::<uint64x2_t, u128>(veorq_u64(hi0, hi1)),
-        )
-    }
 }
 
 mod software {
@@ -777,11 +717,6 @@ mod ext_tests {
                 }
 
                 assert_eq!(F128::dot_product(&a, &b), want, "dot len={len}");
-
-                // F128Acc via accumulate_dot.
-                let mut acc = F128Acc::new();
-                acc.accumulate_dot(&a, &b);
-                assert_eq!(acc.finalize(), want, "accumulate_dot len={len}");
 
                 // F128Acc via per-element accumulate.
                 let mut acc2 = F128Acc::ZERO;
