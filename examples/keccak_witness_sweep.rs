@@ -2,6 +2,8 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use hashcaster2::protocol_state::{KECCAK_BITS, PACKED_KECCAKS, PACKED_MASK, ProtocolState};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{RngCore, SeedableRng};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -61,12 +63,11 @@ fn main() {
 }
 
 fn fill_inputs(input: &mut [u128]) {
-    let mut x = 0x1234_5678_9abc_def0_1357_2468_ace0_bdf1u128;
+    let mut rng = ChaCha20Rng::from_seed(*b"hashcaster2-wit-input-seed-00000");
     for value in input {
-        x = x
-            .wrapping_mul(0xda94_2042_e4dd_58b5_94d0_49bb_1331_11eb)
-            .rotate_left(37);
-        *value = x & PACKED_MASK;
+        let lo = rng.next_u64() as u128;
+        let hi = rng.next_u64() as u128;
+        *value = (lo | (hi << 64)) & PACKED_MASK;
     }
 }
 

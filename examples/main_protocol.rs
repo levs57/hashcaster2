@@ -22,6 +22,8 @@ use hashcaster2::{
     util,
     verifier::GkrVerifierCfg,
 };
+use rand_chacha::ChaCha20Rng;
+use rand_core::{RngCore, SeedableRng};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -33,7 +35,7 @@ fn main() {
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
     )
     .max(1);
-    let bucket_bits = arg_or(&args, 4, 7);
+    let bucket_bits = arg_or(&args, 4, 6);
 
     let blocks = instances.div_ceil(PACKED_KECCAKS).max(1);
     let log_packed_instances = ceil_log2(blocks);
@@ -306,12 +308,11 @@ fn state_claim_eval(
 }
 
 fn fill_inputs(input: &mut [u128]) {
-    let mut x = 0x1234_5678_9abc_def0_1357_2468_ace0_bdf1u128;
-    for (idx, value) in input.iter_mut().enumerate() {
-        x = x
-            .wrapping_mul(0xda94_2042_e4dd_58b5_94d0_49bb_1331_11eb)
-            .rotate_left(37);
-        *value = (x ^ (idx as u128).wrapping_mul(0x9e37_79b9_7f4a_7c15)) & PACKED_MASK;
+    let mut rng = ChaCha20Rng::from_seed(*b"hashcaster2-main-input-seed-0000");
+    for value in input {
+        let lo = rng.next_u64() as u128;
+        let hi = rng.next_u64() as u128;
+        *value = (lo | (hi << 64)) & PACKED_MASK;
     }
 }
 

@@ -9,6 +9,8 @@ use hashcaster2::chi_round::{
 use hashcaster2::field::F128;
 use hashcaster2::protocol_state::{PACKED_KECCAKS, PACKED_MASK, ProtocolState};
 use hashcaster2::{rmfe, util};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{RngCore, SeedableRng};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -201,12 +203,11 @@ fn proof_capacity(log_packed_instances: usize) -> usize {
 }
 
 fn fill_inputs(input: &mut [u128]) {
-    let mut x = 0x1234_5678_9abc_def0_1357_2468_ace0_bdf1u128;
-    for (idx, value) in input.iter_mut().enumerate() {
-        x = x
-            .wrapping_mul(0xda94_2042_e4dd_58b5_94d0_49bb_1331_11eb)
-            .rotate_left(37);
-        *value = (x ^ (idx as u128).wrapping_mul(0x9e37_79b9_7f4a_7c15)) & PACKED_MASK;
+    let mut rng = ChaCha20Rng::from_seed(*b"hashcaster2-chi-input-seed-00000");
+    for value in input {
+        let lo = rng.next_u64() as u128;
+        let hi = rng.next_u64() as u128;
+        *value = (lo | (hi << 64)) & PACKED_MASK;
     }
 }
 
