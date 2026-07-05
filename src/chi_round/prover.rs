@@ -1490,19 +1490,22 @@ fn accumulate_chi_gruen(
     values_hi: [F128; 5],
     eq_x: &[F128],
 ) {
+    let mut s1 = F128::ZERO;
+    let mut sinf = F128::ZERO;
     for x in 0..5 {
         let left = (x + 1) % 5;
         let right = (x + 2) % 5;
-        let scale = scale * eq_x[x];
         let c1 = values_hi[x] + values_hi[right];
         let g1 = values_hi[left] * values_hi[right] + c1 * c1;
         let delta_left = values_lo[left] + values_hi[left];
         let delta_right = values_lo[right] + values_hi[right];
         let delta_c = values_lo[x] + values_hi[x] + delta_right;
         let g_inf = delta_left * delta_right + delta_c * delta_c;
-        acc[0] += scale * g1;
-        acc[1] += scale * g_inf;
+        s1 += eq_x[x] * g1;
+        sinf += eq_x[x] * g_inf;
     }
+    acc[0] += scale * s1;
+    acc[1] += scale * sinf;
 }
 
 #[inline(always)]
@@ -1513,17 +1516,20 @@ fn accumulate_chi_gruen_one_inf(
     values_inf: [F128; 5],
     eq_x: &[F128],
 ) {
+    let mut s1 = F128::ZERO;
+    let mut sinf = F128::ZERO;
     for x in 0..5 {
         let left = (x + 1) % 5;
         let right = (x + 2) % 5;
-        let scale = scale * eq_x[x];
         let c1 = values_one[x] + values_one[right];
         let c_inf = values_inf[x] + values_inf[right];
         let g1 = values_one[left] * values_one[right] + c1 * c1;
         let g_inf = values_inf[left] * values_inf[right] + c_inf * c_inf;
-        acc[0] += scale * g1;
-        acc[1] += scale * g_inf;
+        s1 += eq_x[x] * g1;
+        sinf += eq_x[x] * g_inf;
     }
+    acc[0] += scale * s1;
+    acc[1] += scale * sinf;
 }
 
 fn fold_state(state: &mut [Vec<F128>; 5], active_len: usize, r: F128) {
@@ -1892,14 +1898,21 @@ fn recover_wide_buckets(
             if product.is_zero() {
                 continue;
             }
+            // Fold every set bit of `value` into a single scalar first, so the
+            // (dense, ~384-bit) product is scanned once per bucket instead of
+            // once per set bit — a ~popcount(value)x reduction in XOR traffic.
+            let mut scalar = 0u128;
             let mut bits = value;
             while bits != 0 {
                 let bit = bits.trailing_zeros() as usize;
                 let scalar_bit = bucket_bits * limb_idx + bit;
                 if scalar_bit < 128 {
-                    add_wide_raw_bit(out, product, F128::from_raw(1u128 << scalar_bit));
+                    scalar |= 1u128 << scalar_bit;
                 }
                 bits &= bits - 1;
+            }
+            if scalar != 0 {
+                add_wide_raw_bit(out, product, F128::from_raw(scalar));
             }
         }
     }
