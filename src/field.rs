@@ -201,26 +201,47 @@ mod aarch64 {
         let a_hi = (a >> 64) as u64;
         let b_lo = b as u64;
         let b_hi = (b >> 64) as u64;
-        let zero = vdupq_n_u64(0);
 
-        let t0 = vmull_p64(a_lo, b_lo);
-        let t1a = vmull_p64(a_lo, b_hi);
-        let t1b = vmull_p64(a_hi, b_lo);
-        let t2 = vmull_p64(a_hi, b_hi);
-        let mut t1 = veorq_u64(
-            core::mem::transmute::<_, uint64x2_t>(t1a),
-            core::mem::transmute::<_, uint64x2_t>(t1b),
+        let z0 = core::mem::transmute::<_, uint64x2_t>(vmull_p64(a_lo, b_lo));
+        let z1 = core::mem::transmute::<_, uint64x2_t>(vmull_p64(a_hi, b_hi));
+        let mid = core::mem::transmute::<_, uint64x2_t>(vmull_p64(a_lo ^ a_hi, b_lo ^ b_hi));
+        let z2 = veorq_u64(mid, veorq_u64(z0, z1));
+
+        let v0 = z0;
+        let mut v1 = veorq_u64(vextq_u64::<1>(z0, z0), z2);
+        let mut v2 = veorq_u64(z1, vextq_u64::<1>(z2, z2));
+        let mut v3 = vextq_u64::<1>(z1, z1);
+
+        v2 = veorq_u64(
+            v2,
+            veorq_u64(
+                veorq_u64(v0, vshrq_n_u64::<1>(v0)),
+                veorq_u64(vshrq_n_u64::<2>(v0), vshrq_n_u64::<7>(v0)),
+            ),
         );
-        let t2 = core::mem::transmute::<_, uint64x2_t>(t2);
-        let mut t0 = core::mem::transmute::<_, uint64x2_t>(t0);
+        v1 = veorq_u64(
+            v1,
+            veorq_u64(
+                vshlq_n_u64::<63>(v0),
+                veorq_u64(vshlq_n_u64::<62>(v0), vshlq_n_u64::<57>(v0)),
+            ),
+        );
+        v3 = veorq_u64(
+            v3,
+            veorq_u64(
+                veorq_u64(v1, vshrq_n_u64::<1>(v1)),
+                veorq_u64(vshrq_n_u64::<2>(v1), vshrq_n_u64::<7>(v1)),
+            ),
+        );
+        v2 = veorq_u64(
+            v2,
+            veorq_u64(
+                vshlq_n_u64::<63>(v1),
+                veorq_u64(vshlq_n_u64::<62>(v1), vshlq_n_u64::<57>(v1)),
+            ),
+        );
 
-        t1 = veorq_u64(t1, vextq_u64::<1>(zero, t2));
-        t1 = veorq_u64(t1, core::mem::transmute(vmull_p64(vgetq_lane_u64::<1>(t2), 0x87)));
-
-        t0 = veorq_u64(t0, vextq_u64::<1>(zero, t1));
-        t0 = veorq_u64(t0, core::mem::transmute(vmull_p64(vgetq_lane_u64::<1>(t1), 0x87)));
-
-        (vgetq_lane_u64::<0>(t0) as u128) | ((vgetq_lane_u64::<1>(t0) as u128) << 64)
+        (vgetq_lane_u64::<0>(v2) as u128) | ((vgetq_lane_u64::<0>(v3) as u128) << 64)
     }
 }
 
