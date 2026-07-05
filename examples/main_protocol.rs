@@ -4,7 +4,11 @@ use std::time::{Duration, Instant};
 use hashcaster2::{
     challenger::{FsChallenger, ProofReader, ProofWriter},
     chi_round::{
-        prover::{ProverCfg as ChiProverCfg, ProverScratch as ChiScratch},
+        prover::{
+            ProverCfg as ChiProverCfg,
+            ProverProfile as ChiProverProfile,
+            ProverScratch as ChiScratch,
+        },
         verifier::HybridClaim,
     },
     field::F128,
@@ -128,12 +132,23 @@ fn main() {
     println!("witness gen:   {}", fmt_duration(witness_gen));
     println!("prove median:  {}", fmt_duration(prove_median));
     print_phase("  chi", &profiles, |p| p.chi);
+    print_phase("    build U", &profiles, |p| p.chi_build_u);
+    print_phase("      clear U", &profiles, |p| p.chi_build_u_clear);
+    print_phase("      acc U", &profiles, |p| p.chi_build_u_accumulate);
+    print_phase("      merge U", &profiles, |p| p.chi_build_u_merge);
+    print_phase("      recover U", &profiles, |p| p.chi_build_u_recover);
+    print_phase("    setup", &profiles, |p| p.chi_setup);
+    print_phase("    out msgs", &profiles, |p| p.chi_out_messages);
+    print_phase("    out folds", &profiles, |p| p.chi_out_folds);
+    print_phase("    expand", &profiles, |p| p.chi_expand);
+    print_phase("    tail msgs", &profiles, |p| p.chi_tail_messages);
+    print_phase("    tail folds", &profiles, |p| p.chi_tail_folds);
+    print_phase("    final", &profiles, |p| p.chi_final_claim);
     print_phase("  linrounds", &profiles, |p| p.linrounds);
     println!("verify median: {}", fmt_duration(verify_median));
     println!("proof elems:   {proof_elems}");
     println!("total median:  {}", fmt_duration(total));
     println!("rate:          {:.2} Keccak/s", rate);
-    println!("projected f:   {:.2} Keccak-f[1600]/s", rate / 24.0);
     println!("guard:         {:032x}", black_box(guard));
 }
 
@@ -152,15 +167,26 @@ fn prove_gkr(
         }
         .verify(claim);
 
-        let started = Instant::now();
-        let chi = ChiProverCfg {
+        let chi_cfg = ChiProverCfg {
             log_packed_instances,
             round,
-        }
-        .prove(ctx, &protocol.witness, claim, chi_scratch);
-        if let Some(profile) = profile.as_deref_mut() {
+        };
+        let started = Instant::now();
+        let chi = if let Some(profile) = profile.as_deref_mut() {
+            let mut chi_profile = ChiProverProfile::default();
+            let chi = chi_cfg.prove_profiled(
+                ctx,
+                &protocol.witness,
+                claim,
+                chi_scratch,
+                &mut chi_profile,
+            );
             profile.chi += started.elapsed();
-        }
+            profile.add_chi(chi_profile);
+            chi
+        } else {
+            chi_cfg.prove(ctx, &protocol.witness, claim, chi_scratch)
+        };
 
         let started = Instant::now();
         let mut theta_state = [F128::ZERO; protocol_state::KECCAK_BITS];
@@ -182,7 +208,36 @@ fn prove_gkr(
 #[derive(Clone, Copy, Default)]
 struct MainProfile {
     chi: Duration,
+    chi_build_u: Duration,
+    chi_build_u_clear: Duration,
+    chi_build_u_accumulate: Duration,
+    chi_build_u_merge: Duration,
+    chi_build_u_recover: Duration,
+    chi_setup: Duration,
+    chi_out_messages: Duration,
+    chi_out_folds: Duration,
+    chi_expand: Duration,
+    chi_tail_messages: Duration,
+    chi_tail_folds: Duration,
+    chi_final_claim: Duration,
     linrounds: Duration,
+}
+
+impl MainProfile {
+    fn add_chi(&mut self, profile: ChiProverProfile) {
+        self.chi_build_u += profile.build_u;
+        self.chi_build_u_clear += profile.build_u_clear;
+        self.chi_build_u_accumulate += profile.build_u_accumulate;
+        self.chi_build_u_merge += profile.build_u_merge;
+        self.chi_build_u_recover += profile.build_u_recover;
+        self.chi_setup += profile.setup;
+        self.chi_out_messages += profile.out_messages;
+        self.chi_out_folds += profile.out_folds;
+        self.chi_expand += profile.expand;
+        self.chi_tail_messages += profile.tail_messages;
+        self.chi_tail_folds += profile.tail_folds;
+        self.chi_final_claim += profile.final_claim;
+    }
 }
 
 fn output_claim(protocol: &ProtocolState, log_packed_instances: usize) -> HybridClaim {

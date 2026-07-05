@@ -31,9 +31,7 @@ pub struct ProverScratch {
     bucket_bits: usize,
     u: Vec<F128>,
     buckets: Vec<[WideBoolPoly; BUCKET_COUNT]>,
-    linear_buckets: Vec<[BoolPoly; BUCKET_COUNT]>,
     worker_buckets: Vec<[WideBoolPoly; BUCKET_COUNT]>,
-    worker_linear_buckets: Vec<[BoolPoly; BUCKET_COUNT]>,
     hot_state: Vec<F128>,
     state: [Vec<F128>; 5],
     eq_out: Vec<F128>,
@@ -92,9 +90,7 @@ impl ProverScratch {
             bucket_bits,
             u: vec![F128::ZERO; rmfe::PRODUCT_BITS],
             buckets: vec![[WideBoolPoly::ZERO; BUCKET_COUNT]; BUCKET_LIMBS],
-            linear_buckets: vec![[BoolPoly::ZERO; BUCKET_COUNT]; BUCKET_LIMBS],
             worker_buckets: vec![[WideBoolPoly::ZERO; BUCKET_COUNT]; BUCKET_LIMBS * workers],
-            worker_linear_buckets: vec![[BoolPoly::ZERO; BUCKET_COUNT]; BUCKET_LIMBS * workers],
             hot_state: vec![F128::ZERO; out_len * protocol_state::KECCAK_BITS],
             state: core::array::from_fn(|_| vec![F128::ZERO; yz_len]),
             eq_out: vec![F128::ZERO; out_len],
@@ -119,9 +115,7 @@ impl ProverScratch {
         let yz_len = 1usize << (3 + 6);
         assert_eq!(self.u.len(), rmfe::PRODUCT_BITS);
         assert_eq!(self.buckets.len(), BUCKET_LIMBS);
-        assert_eq!(self.linear_buckets.len(), BUCKET_LIMBS);
         assert_eq!(self.worker_buckets.len(), BUCKET_LIMBS * self.workers);
-        assert_eq!(self.worker_linear_buckets.len(), BUCKET_LIMBS * self.workers);
         assert_eq!(self.hot_state.len(), out_len * protocol_state::KECCAK_BITS);
         assert_eq!(self.eq_out.len(), out_len);
         assert_eq!(self.eq_yz.len(), yz_len);
@@ -197,9 +191,7 @@ impl ProverCfg {
                 &scratch.eq_out,
                 &scratch.eq_strips,
                 &mut scratch.buckets,
-                &mut scratch.linear_buckets,
                 &mut scratch.worker_buckets,
-                &mut scratch.worker_linear_buckets,
                 scratch.workers,
                 scratch.bucket_bits,
                 &mut scratch.u,
@@ -215,9 +207,7 @@ impl ProverCfg {
                 &scratch.eq_out,
                 &scratch.eq_strips,
                 &mut scratch.buckets,
-                &mut scratch.linear_buckets,
                 &mut scratch.worker_buckets,
-                &mut scratch.worker_linear_buckets,
                 scratch.workers,
                 scratch.bucket_bits,
                 &mut scratch.u,
@@ -229,7 +219,6 @@ impl ProverCfg {
         let started = Instant::now();
         let t = ctx.sample_f128();
         fill_embed_eval_tables(t, &mut scratch.embed_evals);
-        let one = encoded_one_eval(t);
         let mut active_blocks = 1usize << self.log_packed_instances;
         if active_blocks == 1 {
             build_hot_state(
@@ -263,7 +252,6 @@ impl ProverCfg {
                     &scratch.eq_strips,
                     active_blocks,
                     active_real_blocks,
-                    one,
                     &eq_x,
                     scratch.workers,
                 )
@@ -274,7 +262,6 @@ impl ProverCfg {
                     &scratch.eq_strips,
                     active_blocks,
                     active_real_blocks,
-                    one,
                     &eq_x,
                     scratch.workers,
                 )
@@ -303,7 +290,6 @@ impl ProverCfg {
                         active_blocks,
                         active_real_blocks,
                         challenge,
-                        one,
                         &eq_x,
                         scratch.workers,
                         &mut scratch.hot_state,
@@ -333,7 +319,6 @@ impl ProverCfg {
                     active_blocks,
                     active_real_blocks,
                     challenge,
-                    one,
                     &eq_x,
                     scratch.workers,
                 ));
@@ -381,7 +366,6 @@ impl ProverCfg {
                 &scratch.state,
                 &scratch.eq_yz,
                 active_len,
-                one,
                 &eq_x,
             );
             ctx.write_f128_slice(&msg);
@@ -441,9 +425,7 @@ fn build_u(
     eq_out: &[F128],
     eq_strips: &[F128],
     buckets: &mut [[WideBoolPoly; BUCKET_COUNT]],
-    linear_buckets: &mut [[BoolPoly; BUCKET_COUNT]],
     worker_buckets: &mut [[WideBoolPoly; BUCKET_COUNT]],
-    worker_linear_buckets: &mut [[BoolPoly; BUCKET_COUNT]],
     workers: usize,
     bucket_bits: usize,
     out: &mut [F128],
@@ -458,14 +440,10 @@ fn build_u(
     for &value in &eq_out[real_out_len..out_len] {
         virtual_out_eq += value;
     }
-    let one = encoded_one_poly();
     let started = Instant::now();
     out.fill(F128::ZERO);
     for bucket_set in &mut buckets[..bucket_limbs] {
         bucket_set[..bucket_count].fill(WideBoolPoly::ZERO);
-    }
-    for bucket_set in &mut linear_buckets[..bucket_limbs] {
-        bucket_set[..bucket_count].fill(BoolPoly::ZERO);
     }
     if let Some(profile) = profile.as_deref_mut() {
         profile.build_u_clear += started.elapsed();
@@ -480,14 +458,6 @@ fn build_u(
                 bucket_set[..bucket_count].fill(WideBoolPoly::ZERO);
             }
         }
-        for worker_bucket_set in worker_linear_buckets
-            .chunks_mut(BUCKET_LIMBS)
-            .take(worker_count)
-        {
-            for bucket_set in &mut worker_bucket_set[..bucket_limbs] {
-                bucket_set[..bucket_count].fill(BoolPoly::ZERO);
-            }
-        }
         if let Some(profile) = profile.as_deref_mut() {
             profile.build_u_clear += started.elapsed();
         }
@@ -496,10 +466,9 @@ fn build_u(
         let strip_chunk = HOT_STRIPS.div_ceil(worker_count);
         worker_buckets
             .par_chunks_mut(BUCKET_LIMBS)
-            .zip(worker_linear_buckets.par_chunks_mut(BUCKET_LIMBS))
             .take(worker_count)
             .enumerate()
-            .for_each(|(worker_idx, (worker_buckets, worker_linear_buckets))| {
+            .for_each(|(worker_idx, worker_buckets)| {
                 let strip_start = worker_idx * strip_chunk;
                 let strip_end = (strip_start + strip_chunk).min(HOT_STRIPS);
                 accumulate_u_strip_range(
@@ -512,7 +481,6 @@ fn build_u(
                     eq_strips,
                     eq_x,
                     worker_buckets,
-                    worker_linear_buckets,
                     bucket_bits,
                 );
                 if virtual_out_eq != F128::ZERO {
@@ -524,7 +492,6 @@ fn build_u(
                         eq_x,
                         eq_strips,
                         worker_buckets,
-                        worker_linear_buckets,
                         bucket_bits,
                     );
                 }
@@ -536,15 +503,7 @@ fn build_u(
         let started = Instant::now();
         for worker_idx in 0..worker_count {
             let worker_buckets = &worker_buckets[worker_idx * BUCKET_LIMBS..][..BUCKET_LIMBS];
-            let worker_linear_buckets =
-                &worker_linear_buckets[worker_idx * BUCKET_LIMBS..][..BUCKET_LIMBS];
             xor_wide_bucket_sets(buckets, worker_buckets, bucket_limbs, bucket_count);
-            xor_linear_bucket_sets(
-                linear_buckets,
-                worker_linear_buckets,
-                bucket_limbs,
-                bucket_count,
-            );
         }
         if let Some(profile) = profile.as_deref_mut() {
             profile.build_u_merge += started.elapsed();
@@ -561,7 +520,6 @@ fn build_u(
             eq_strips,
             eq_x,
             buckets,
-            linear_buckets,
             bucket_bits,
         );
         if virtual_out_eq != F128::ZERO {
@@ -573,7 +531,6 @@ fn build_u(
                 eq_x,
                 eq_strips,
                 buckets,
-                linear_buckets,
                 bucket_bits,
             );
         }
@@ -584,7 +541,6 @@ fn build_u(
 
     let started = Instant::now();
     recover_wide_buckets(buckets, bucket_bits, out);
-    recover_linear_buckets(linear_buckets, bucket_bits, one, out);
     if let Some(profile) = profile.as_deref_mut() {
         profile.build_u_recover += started.elapsed();
     }
@@ -600,7 +556,6 @@ fn accumulate_u_strip_range(
     eq_strips: &[F128],
     eq_x: &[F128],
     buckets: &mut [[WideBoolPoly; BUCKET_COUNT]],
-    linear_buckets: &mut [[BoolPoly; BUCKET_COUNT]],
     bucket_bits: usize,
 ) {
     debug_assert!(real_out_len > 0);
@@ -621,7 +576,7 @@ fn accumulate_u_strip_range(
                 strip[base + 3],
                 strip[base + 4],
             ];
-            accumulate_chi_row(words, out_eq, strip_scalars, buckets, linear_buckets, bucket_bits);
+            accumulate_chi_row(words, out_eq, strip_scalars, buckets, bucket_bits);
         }
     }
 }
@@ -634,7 +589,6 @@ fn accumulate_u_virtual_strip_range(
     eq_x: &[F128],
     eq_strips: &[F128],
     buckets: &mut [[WideBoolPoly; BUCKET_COUNT]],
-    linear_buckets: &mut [[BoolPoly; BUCKET_COUNT]],
     bucket_bits: usize,
 ) {
     for strip_idx in start_strip..end_strip {
@@ -645,7 +599,7 @@ fn accumulate_u_virtual_strip_range(
         if out_eq != F128::ZERO && strip_scalars.iter().any(|&value| value != F128::ZERO) {
             let words: [u128; 5] =
                 core::array::from_fn(|x| protocol_state::zero_pre_chi_word(round, x, y, z));
-            accumulate_chi_row(words, out_eq, strip_scalars, buckets, linear_buckets, bucket_bits);
+            accumulate_chi_row(words, out_eq, strip_scalars, buckets, bucket_bits);
         }
     }
 }
@@ -667,7 +621,6 @@ fn accumulate_chi_row(
     out_eq: F128,
     strip_scalars: [F128; 5],
     buckets: &mut [[WideBoolPoly; BUCKET_COUNT]],
-    linear_buckets: &mut [[BoolPoly; BUCKET_COUNT]],
     bucket_bits: usize,
 ) {
     let p0 = embed_word_poly(words[0]);
@@ -676,17 +629,16 @@ fn accumulate_chi_row(
     let p3 = embed_word_poly(words[3]);
     let p4 = embed_word_poly(words[4]);
 
-    accumulate_chi_term(buckets, linear_buckets, p1, p2, p0 ^ p2, out_eq * strip_scalars[0], bucket_bits);
-    accumulate_chi_term(buckets, linear_buckets, p2, p3, p1 ^ p3, out_eq * strip_scalars[1], bucket_bits);
-    accumulate_chi_term(buckets, linear_buckets, p3, p4, p2 ^ p4, out_eq * strip_scalars[2], bucket_bits);
-    accumulate_chi_term(buckets, linear_buckets, p4, p0, p3 ^ p0, out_eq * strip_scalars[3], bucket_bits);
-    accumulate_chi_term(buckets, linear_buckets, p0, p1, p4 ^ p1, out_eq * strip_scalars[4], bucket_bits);
+    accumulate_chi_term(buckets, p1, p2, p0 ^ p2, out_eq * strip_scalars[0], bucket_bits);
+    accumulate_chi_term(buckets, p2, p3, p1 ^ p3, out_eq * strip_scalars[1], bucket_bits);
+    accumulate_chi_term(buckets, p3, p4, p2 ^ p4, out_eq * strip_scalars[2], bucket_bits);
+    accumulate_chi_term(buckets, p4, p0, p3 ^ p0, out_eq * strip_scalars[3], bucket_bits);
+    accumulate_chi_term(buckets, p0, p1, p4 ^ p1, out_eq * strip_scalars[4], bucket_bits);
 }
 
 #[inline(always)]
 fn accumulate_chi_term(
     buckets: &mut [[WideBoolPoly; BUCKET_COUNT]],
-    linear_buckets: &mut [[BoolPoly; BUCKET_COUNT]],
     left: BoolPoly,
     right: BoolPoly,
     linear: BoolPoly,
@@ -695,11 +647,10 @@ fn accumulate_chi_term(
 ) {
     accumulate_wide(
         buckets,
-        boolpoly::clmul_192(left, right),
+        boolpoly::clmul_192(left, right) ^ boolpoly::square_192(linear),
         scalar,
         bucket_bits,
     );
-    accumulate_poly(linear_buckets, linear, scalar, bucket_bits);
 }
 
 #[inline(always)]
@@ -847,7 +798,6 @@ fn out_round_gruen(
     eq_strips: &[F128],
     active_blocks: usize,
     real_blocks: usize,
-    one: F128,
     eq_x: &[F128],
     workers: usize,
 ) -> [F128; 2] {
@@ -878,7 +828,6 @@ fn out_round_gruen(
                     real_pair_count,
                     has_mixed_pair,
                     virtual_eq,
-                    one,
                     eq_x,
                 )
             })
@@ -902,7 +851,6 @@ fn out_round_gruen(
         real_pair_count,
         has_mixed_pair,
         virtual_eq,
-        one,
         eq_x,
     )
 }
@@ -915,7 +863,6 @@ fn out_round_gruen_from_witness(
     eq_strips: &[F128],
     active_blocks: usize,
     real_blocks: usize,
-    one: F128,
     eq_x: &[F128],
     workers: usize,
 ) -> [F128; 2] {
@@ -948,7 +895,6 @@ fn out_round_gruen_from_witness(
                     real_pair_count,
                     has_mixed_pair,
                     virtual_eq,
-                    one,
                     eq_x,
                 )
             })
@@ -974,7 +920,6 @@ fn out_round_gruen_from_witness(
         real_pair_count,
         has_mixed_pair,
         virtual_eq,
-        one,
         eq_x,
     )
 }
@@ -991,7 +936,6 @@ fn out_round_gruen_from_witness_strip_range(
     real_pair_count: usize,
     has_mixed_pair: bool,
     virtual_eq: F128,
-    one: F128,
     eq_x: &[F128],
 ) -> [F128; 2] {
     let mut acc = [F128::ZERO; 2];
@@ -1026,7 +970,6 @@ fn out_round_gruen_from_witness_strip_range(
                 yz_eq * eq,
                 values_one,
                 values_inf,
-                one,
                 eq_x,
             );
         }
@@ -1052,7 +995,6 @@ fn out_round_gruen_from_witness_strip_range(
                 yz_eq * eq,
                 values_one,
                 values_inf,
-                one,
                 eq_x,
             );
         }
@@ -1076,7 +1018,6 @@ fn out_round_gruen_from_witness_strip_range(
                 yz_eq * virtual_eq,
                 values_one,
                 values_inf,
-                one,
                 eq_x,
             );
         }
@@ -1094,7 +1035,6 @@ fn out_round_gruen_strip_range(
     real_pair_count: usize,
     has_mixed_pair: bool,
     virtual_eq: F128,
-    one: F128,
     eq_x: &[F128],
 ) -> [F128; 2] {
     let mut acc = [F128::ZERO; 2];
@@ -1117,7 +1057,6 @@ fn out_round_gruen_strip_range(
                 yz_eq * eq,
                 values_lo,
                 values_hi,
-                one,
                 eq_x,
             );
         }
@@ -1133,7 +1072,6 @@ fn out_round_gruen_strip_range(
                 yz_eq * eq,
                 values_lo,
                 values_hi,
-                one,
                 eq_x,
             );
         }
@@ -1145,7 +1083,6 @@ fn out_round_gruen_strip_range(
                 yz_eq * virtual_eq,
                 values_lo,
                 values_lo,
-                one,
                 eq_x,
             );
         }
@@ -1162,7 +1099,6 @@ fn build_folded_hot_state_and_next_gruen_from_witness(
     active_blocks: usize,
     real_blocks: usize,
     r: F128,
-    one: F128,
     eq_x: &[F128],
     workers: usize,
     state: &mut [F128],
@@ -1207,7 +1143,6 @@ fn build_folded_hot_state_and_next_gruen_from_witness(
                     eq_out,
                     eq_strips,
                     r,
-                    one,
                     eq_x,
                 )
             })
@@ -1236,7 +1171,6 @@ fn build_folded_hot_state_and_next_gruen_from_witness(
         eq_out,
         eq_strips,
         r,
-        one,
         eq_x,
     )
 }
@@ -1281,7 +1215,6 @@ fn build_folded_hot_state_and_next_gruen_from_witness_strips(
     eq_out: &[F128],
     eq_strips: &[F128],
     r: F128,
-    one: F128,
     eq_x: &[F128],
 ) -> [F128; 2] {
     let strip_len = out_len * 5;
@@ -1316,7 +1249,7 @@ fn build_folded_hot_state_and_next_gruen_from_witness_strips(
                     out_strip[(out_idx + 1) * 5 + x] = values_hi[x];
                 }
                 let eq = eq_out[out_idx] + eq_out[out_idx + 1];
-                accumulate_chi_gruen(&mut acc, yz_eq * eq, values_lo, values_hi, one, eq_x);
+                accumulate_chi_gruen(&mut acc, yz_eq * eq, values_lo, values_hi, eq_x);
             }
 
             if has_mixed_pair {
@@ -1330,13 +1263,13 @@ fn build_folded_hot_state_and_next_gruen_from_witness_strips(
                     out_strip[(out_idx + 1) * 5 + x] = values_hi[x];
                 }
                 let eq = eq_out[out_idx] + eq_out[out_idx + 1];
-                accumulate_chi_gruen(&mut acc, yz_eq * eq, values_lo, values_hi, one, eq_x);
+                accumulate_chi_gruen(&mut acc, yz_eq * eq, values_lo, values_hi, eq_x);
             }
 
             if virtual_eq != F128::ZERO {
                 let values =
                     folded_witness_pair_values(real_strip, real_blocks, real_blocks, coords, embed_evals, inf_scale);
-                accumulate_chi_gruen(&mut acc, yz_eq * virtual_eq, values, values, one, eq_x);
+                accumulate_chi_gruen(&mut acc, yz_eq * virtual_eq, values, values, eq_x);
             }
         } else {
             for out in 0..next_real {
@@ -1531,7 +1464,6 @@ fn tail_round_gruen(
     state: &[Vec<F128>; 5],
     eq: &[F128],
     active_len: usize,
-    one: F128,
     eq_x: &[F128],
 ) -> [F128; 2] {
     let mut acc = [F128::ZERO; 2];
@@ -1544,7 +1476,6 @@ fn tail_round_gruen(
             scale,
             values_lo,
             values_hi,
-            one,
             eq_x,
         );
     }
@@ -1557,17 +1488,18 @@ fn accumulate_chi_gruen(
     scale: F128,
     values_lo: [F128; 5],
     values_hi: [F128; 5],
-    one: F128,
     eq_x: &[F128],
 ) {
     for x in 0..5 {
         let left = (x + 1) % 5;
         let right = (x + 2) % 5;
         let scale = scale * eq_x[x];
-        let g1 = values_hi[left] * values_hi[right] + (values_hi[x] + values_hi[right]) * one;
+        let c1 = values_hi[x] + values_hi[right];
+        let g1 = values_hi[left] * values_hi[right] + c1 * c1;
         let delta_left = values_lo[left] + values_hi[left];
         let delta_right = values_lo[right] + values_hi[right];
-        let g_inf = delta_left * delta_right;
+        let delta_c = values_lo[x] + values_hi[x] + delta_right;
+        let g_inf = delta_left * delta_right + delta_c * delta_c;
         acc[0] += scale * g1;
         acc[1] += scale * g_inf;
     }
@@ -1579,15 +1511,16 @@ fn accumulate_chi_gruen_one_inf(
     scale: F128,
     values_one: [F128; 5],
     values_inf: [F128; 5],
-    one: F128,
     eq_x: &[F128],
 ) {
     for x in 0..5 {
         let left = (x + 1) % 5;
         let right = (x + 2) % 5;
         let scale = scale * eq_x[x];
-        let g1 = values_one[left] * values_one[right] + (values_one[x] + values_one[right]) * one;
-        let g_inf = values_inf[left] * values_inf[right];
+        let c1 = values_one[x] + values_one[right];
+        let c_inf = values_inf[x] + values_inf[right];
+        let g1 = values_one[left] * values_one[right] + c1 * c1;
+        let g_inf = values_inf[left] * values_inf[right] + c_inf * c_inf;
         acc[0] += scale * g1;
         acc[1] += scale * g_inf;
     }
@@ -1613,7 +1546,6 @@ fn fold_hot_state_and_next_gruen(
     active_blocks: usize,
     real_blocks: usize,
     r: F128,
-    one: F128,
     eq_x: &[F128],
     workers: usize,
 ) -> [F128; 2] {
@@ -1654,7 +1586,6 @@ fn fold_hot_state_and_next_gruen(
                     eq_out,
                     eq_strips,
                     r,
-                    one,
                     eq_x,
                 )
             })
@@ -1680,7 +1611,6 @@ fn fold_hot_state_and_next_gruen(
         eq_out,
         eq_strips,
         r,
-        one,
         eq_x,
     )
 }
@@ -1712,7 +1642,6 @@ fn fold_hot_state_and_next_gruen_strips(
     eq_out: &[F128],
     eq_strips: &[F128],
     r: F128,
-    one: F128,
     eq_x: &[F128],
 ) -> [F128; 2] {
     let strip_len = out_len * 5;
@@ -1733,7 +1662,7 @@ fn fold_hot_state_and_next_gruen_strips(
                     strip[(out_idx + 1) * 5 + x] = values_hi[x];
                 }
                 let eq = eq_out[out_idx] + eq_out[out_idx + 1];
-                accumulate_chi_gruen(&mut acc, yz_eq * eq, values_lo, values_hi, one, eq_x);
+                accumulate_chi_gruen(&mut acc, yz_eq * eq, values_lo, values_hi, eq_x);
             }
 
             if has_mixed_pair {
@@ -1745,12 +1674,12 @@ fn fold_hot_state_and_next_gruen_strips(
                     strip[(out_idx + 1) * 5 + x] = values_hi[x];
                 }
                 let eq = eq_out[out_idx] + eq_out[out_idx + 1];
-                accumulate_chi_gruen(&mut acc, yz_eq * eq, values_lo, values_hi, one, eq_x);
+                accumulate_chi_gruen(&mut acc, yz_eq * eq, values_lo, values_hi, eq_x);
             }
 
             if virtual_eq != F128::ZERO {
                 let values = fold_hot_pair_values(strip, real_blocks, real_blocks, r);
-                accumulate_chi_gruen(&mut acc, yz_eq * virtual_eq, values, values, one, eq_x);
+                accumulate_chi_gruen(&mut acc, yz_eq * virtual_eq, values, values, eq_x);
             }
         } else {
             for out in 0..next_real {
@@ -1871,26 +1800,6 @@ fn embed_tables() -> &'static [[BoolPoly; 256]; WORD_BYTES] {
     })
 }
 
-fn encoded_one_poly() -> BoolPoly {
-    embed_word_poly((1u128 << rmfe::RMFE_BITS) - 1)
-}
-
-fn encoded_one_eval(t: F128) -> F128 {
-    evaluate_bool_poly(encoded_one_poly(), t)
-}
-
-fn evaluate_bool_poly(poly: BoolPoly, point: F128) -> F128 {
-    let limbs = poly.limbs();
-    let mut acc = F128::ZERO;
-    for coeff in (0..rmfe::PRODUCT_DEGREE).rev() {
-        acc *= point;
-        if ((limbs[coeff / 64] >> (coeff % 64)) & 1) != 0 {
-            acc += F128::ONE;
-        }
-    }
-    acc
-}
-
 fn fill_embed_eval_tables(t: F128, out: &mut [[F128; 256]; WORD_BYTES]) {
     let mut basis_evals = [F128::ZERO; rmfe::RMFE_BITS];
     let matrix = rmfe::embedding_matrix();
@@ -1958,51 +1867,9 @@ fn accumulate_wide(
     }
 }
 
-fn accumulate_poly(
-    buckets: &mut [[BoolPoly; BUCKET_COUNT]],
-    poly: BoolPoly,
-    scalar: F128,
-    bucket_bits: usize,
-) {
-    let raw = scalar.raw();
-    match bucket_bits {
-        8 => {
-            for (limb_idx, &value) in raw.to_le_bytes().iter().enumerate() {
-                buckets[limb_idx][value as usize] ^= poly;
-            }
-        }
-        7 => {
-            for limb_idx in 0..bucket_limbs(7) {
-                let value = ((raw >> (7 * limb_idx)) & 0x7f) as usize;
-                buckets[limb_idx][value] ^= poly;
-            }
-        }
-        6 => {
-            for limb_idx in 0..bucket_limbs(6) {
-                let value = ((raw >> (6 * limb_idx)) & 0x3f) as usize;
-                buckets[limb_idx][value] ^= poly;
-            }
-        }
-        _ => unreachable!(),
-    }
-}
-
 fn xor_wide_bucket_sets(
     out: &mut [[WideBoolPoly; BUCKET_COUNT]],
     rhs: &[[WideBoolPoly; BUCKET_COUNT]],
-    bucket_limbs: usize,
-    bucket_count: usize,
-) {
-    for limb_idx in 0..bucket_limbs {
-        for value in 0..bucket_count {
-            out[limb_idx][value] ^= rhs[limb_idx][value];
-        }
-    }
-}
-
-fn xor_linear_bucket_sets(
-    out: &mut [[BoolPoly; BUCKET_COUNT]],
-    rhs: &[[BoolPoly; BUCKET_COUNT]],
     bucket_limbs: usize,
     bucket_count: usize,
 ) {
@@ -2025,33 +1892,6 @@ fn recover_wide_buckets(
             if product.is_zero() {
                 continue;
             }
-            let mut bits = value;
-            while bits != 0 {
-                let bit = bits.trailing_zeros() as usize;
-                let scalar_bit = bucket_bits * limb_idx + bit;
-                if scalar_bit < 128 {
-                    add_wide_raw_bit(out, product, F128::from_raw(1u128 << scalar_bit));
-                }
-                bits &= bits - 1;
-            }
-        }
-    }
-}
-
-fn recover_linear_buckets(
-    buckets: &[[BoolPoly; BUCKET_COUNT]],
-    bucket_bits: usize,
-    one: BoolPoly,
-    out: &mut [F128],
-) {
-    let bucket_count = 1usize << bucket_bits;
-    for (limb_idx, bucket_set) in buckets[..bucket_limbs(bucket_bits)].iter().enumerate() {
-        for value in 1..bucket_count {
-            let poly = bucket_set[value];
-            if poly.is_zero() {
-                continue;
-            }
-            let product = boolpoly::clmul_192(poly, one);
             let mut bits = value;
             while bits != 0 {
                 let bit = bits.trailing_zeros() as usize;

@@ -418,7 +418,6 @@ fn slow_chi_initial_claim(
     let eq_y = util::eq_poly_v(&claim.r_y);
     let eq_z = util::eq_poly_v(&claim.r_z);
     let eq_out = util::eq_poly_v(&claim.r_out);
-    let one = slow_embed_word((1u128 << rmfe::RMFE_BITS) - 1);
     let mut u = vec![F128::ZERO; rmfe::PRODUCT_BITS];
 
     for out in 0..(1usize << log_packed_instances) {
@@ -444,9 +443,10 @@ fn slow_chi_initial_claim(
                         z,
                     ));
                     let center = slow_embed_word(slow_state_word(witness, round, out, x, y, z));
+                    let c: [F128; rmfe::PRODUCT_DEGREE] =
+                        core::array::from_fn(|idx| center[idx] + right[idx]);
                     slow_add_product(&mut u, &left, &right, scalar);
-                    slow_add_product(&mut u, &center, &one, scalar);
-                    slow_add_product(&mut u, &right, &one, scalar);
+                    slow_add_product(&mut u, &c, &c, scalar);
                 }
             }
         }

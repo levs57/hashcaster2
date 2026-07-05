@@ -2,7 +2,7 @@ use crate::{
     challenger::{Challenger, ProofReader, ProofTranscriptError},
     field::F128,
     rmfe,
-    util::{apply_boolean_matrix, eq_poly_v, evaluate_univar, rmfe_one_eval},
+    util::{apply_boolean_matrix, eq_poly_v, evaluate_univar},
 };
 
 #[derive(Clone, Copy)]
@@ -135,13 +135,13 @@ impl VerifierCfg {
         }
 
         let inputs = ctx.read_f128_vec(5)?;
-        let one = encoded_one_eval(t);
         let eq_x = eq_poly_v(&claim.r_x);
         let mut expected = F128::ZERO;
         for x in 0..5 {
             let left = inputs[(x + 1) % 5];
             let right = inputs[(x + 2) % 5];
-            expected += eq_x[x] * (left * right + (inputs[x] + right) * one);
+            let c = inputs[x] + right;
+            expected += eq_x[x] * (left * right + c * c);
         }
         if expected != running_claim {
             return Err(VerifierError::InvalidProof);
@@ -163,8 +163,4 @@ impl VerifierCfg {
             ev,
         })
     }
-}
-
-fn encoded_one_eval(t: F128) -> F128 {
-    rmfe_one_eval(t)
 }

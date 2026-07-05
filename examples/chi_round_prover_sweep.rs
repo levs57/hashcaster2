@@ -159,10 +159,6 @@ fn run_case(instances: usize, runs: usize, round: usize, workers: usize, bucket_
         median_rate,
     );
     println!(
-        "  projected f:  {:.2} Keccak-f[1600]/s",
-        median_rate / 24.0,
-    );
-    println!(
         "  capacity rate:{:>9.2} Keccak/s",
         capacity as f64 / median.as_secs_f64(),
     );

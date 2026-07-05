@@ -154,6 +154,17 @@ pub fn clmul_192(lhs: BoolPoly, rhs: BoolPoly) -> WideBoolPoly {
     WideBoolPoly::from_limbs(out)
 }
 
+pub fn square_192(value: BoolPoly) -> WideBoolPoly {
+    let value = value.limbs();
+    let mut out = [0u64; 6];
+    for i in 0..3 {
+        let product = clmul_64(value[i], value[i]);
+        out[2 * i] = product as u64;
+        out[2 * i + 1] = (product >> 64) as u64;
+    }
+    WideBoolPoly::from_limbs(out)
+}
+
 pub(crate) fn mul_small(lhs: BoolPoly, rhs: u16) -> BoolPoly {
     let mut out = BoolPoly::ZERO;
     let mut bits = rhs;
