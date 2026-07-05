@@ -2,11 +2,11 @@
 
 New keccak GKR protocol based on new cool RMFE-in-polynomial-ring and univariate skip. Full GKR proving routine (24 rounds of keccak permutation) is integrated, commitments are not integrated yet.
 
-Uses $\mathbb{F}_{2^{128}}$ in POLYVAL basis.
+Uses `F2^128` in POLYVAL basis.
 
 On my 32-core x86 it proves ~220k / s Keccak permutations, Neon benchmarks and optimizations pending. There are also probably some tricks related to AVX-512 SIMD, this requires AVX-256 or Neon+aes only.
 
-Protocol description: https://hackmd.io/@levs57/HJkT2mEXMx (described for the bitwise AND gate, for Keccak specifically I of course use Keccak's quadratic gate, but the main idea can be read there; another note is that I use 96-dimensional subspace in $\mathbb{F}_2[x]_{\leq 192}$, not 64-dimensional subspace in $\mathbb{F}_2[x]_{\leq 128}$).
+Protocol description: https://hackmd.io/@levs57/HJkT2mEXMx (described for the bitwise AND gate, for Keccak specifically I of course use Keccak's quadratic gate, but the main idea can be read there; another note is that I use 96-dimensional subspace in `F2[X]_{<= 192}`, not 64-dimensional subspace in `F2[X]_{<=128}`.
 
 Example run:
 
