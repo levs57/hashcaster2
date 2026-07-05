@@ -86,33 +86,6 @@ impl F128 {
         b127.square() // (2^127 - 1) * 2 = 2^128 - 2
     }
 
-    /// Element-wise batched multiply: `out[i] = a[i] * b[i]`.
-    ///
-    /// Independent products are interleaved four at a time so their Karatsuba
-    /// and reduction chains overlap across the M-series' multiple PMULL
-    /// pipelines, hiding per-multiply latency in throughput-bound code.  The
-    /// three slices must have equal length.
-    pub fn mul_batch(a: &[Self], b: &[Self], out: &mut [Self]) {
-        assert_eq!(a.len(), b.len());
-        assert_eq!(a.len(), out.len());
-        let n = a.len();
-        let mut i = 0;
-        while i + 4 <= n {
-            let av = [a[i].raw, a[i + 1].raw, a[i + 2].raw, a[i + 3].raw];
-            let bv = [b[i].raw, b[i + 1].raw, b[i + 2].raw, b[i + 3].raw];
-            let r = ext::mul_x4(&av, &bv);
-            out[i] = Self::from_raw(r[0]);
-            out[i + 1] = Self::from_raw(r[1]);
-            out[i + 2] = Self::from_raw(r[2]);
-            out[i + 3] = Self::from_raw(r[3]);
-            i += 4;
-        }
-        while i < n {
-            out[i] = a[i] * b[i];
-            i += 1;
-        }
-    }
-
     /// Deferred-reduction dot product: `sum_i a[i] * b[i]` over the field, with
     /// a single final reduction.  Much faster than a fold of independent
     /// multiplies for dot-product-shaped loops.  `a` and `b` must be equal
@@ -275,10 +248,6 @@ mod ext {
         unsafe { aarch64::square_128(a) }
     }
     #[inline(always)]
-    pub(super) fn mul_x4(a: &[u128; 4], b: &[u128; 4]) -> [u128; 4] {
-        unsafe { aarch64::mul_128_x4(a, b) }
-    }
-    #[inline(always)]
     pub(super) fn dot(a: &[u128], b: &[u128]) -> u128 {
         unsafe { aarch64::dot_product(a, b) }
     }
@@ -303,15 +272,6 @@ mod ext {
     #[inline(always)]
     pub(super) fn square(a: u128) -> u128 {
         mul_dispatch(a, a)
-    }
-    #[inline(always)]
-    pub(super) fn mul_x4(a: &[u128; 4], b: &[u128; 4]) -> [u128; 4] {
-        [
-            mul_dispatch(a[0], b[0]),
-            mul_dispatch(a[1], b[1]),
-            mul_dispatch(a[2], b[2]),
-            mul_dispatch(a[3], b[3]),
-        ]
     }
     #[inline(always)]
     pub(super) fn dot(a: &[u128], b: &[u128]) -> u128 {
@@ -498,28 +458,6 @@ mod aarch64 {
     pub unsafe fn square_128(a: u128) -> u128 {
         let (lo, hi) = sq_wide(a as u64, (a >> 64) as u64);
         transmute::<uint64x2_t, u128>(reduce(lo, hi))
-    }
-
-    /// Four independent multiplies with interleaved Karatsuba + reduction
-    /// chains to fill the M-series' multiple PMULL pipelines and hide the
-    /// ~3-cycle PMULL latency behind independent work.
-    #[inline]
-    #[target_feature(enable = "aes")]
-    pub unsafe fn mul_128_x4(a: &[u128; 4], b: &[u128; 4]) -> [u128; 4] {
-        let (l0, h0) = clmul_wide(a[0] as u64, (a[0] >> 64) as u64, b[0] as u64, (b[0] >> 64) as u64);
-        let (l1, h1) = clmul_wide(a[1] as u64, (a[1] >> 64) as u64, b[1] as u64, (b[1] >> 64) as u64);
-        let (l2, h2) = clmul_wide(a[2] as u64, (a[2] >> 64) as u64, b[2] as u64, (b[2] >> 64) as u64);
-        let (l3, h3) = clmul_wide(a[3] as u64, (a[3] >> 64) as u64, b[3] as u64, (b[3] >> 64) as u64);
-        let r0 = reduce(l0, h0);
-        let r1 = reduce(l1, h1);
-        let r2 = reduce(l2, h2);
-        let r3 = reduce(l3, h3);
-        [
-            transmute::<uint64x2_t, u128>(r0),
-            transmute::<uint64x2_t, u128>(r1),
-            transmute::<uint64x2_t, u128>(r2),
-            transmute::<uint64x2_t, u128>(r3),
-        ]
     }
 
     /// Deferred-reduction dot product: `reduce(sum_i a_i * b_i)`.  The 256-bit
@@ -822,31 +760,6 @@ mod ext_tests {
             assert_eq!(a * inv, F128::ONE);
         }
         assert_eq!(F128::ONE.inverse(), F128::ONE);
-    }
-
-    #[test]
-    fn mul_batch_matches_elementwise() {
-        let mut rng = Rng(0xABCD_1234);
-        // Cover every residue of length mod 4 (tail handling).
-        for len in [0usize, 1, 2, 3, 4, 5, 7, 8, 15, 16, 33, 257] {
-            let a: Vec<F128> = (0..len).map(|_| rng.next_f128()).collect();
-            let b: Vec<F128> = (0..len).map(|_| rng.next_f128()).collect();
-            let mut out = vec![F128::ZERO; len];
-            F128::mul_batch(&a, &b, &mut out);
-            for i in 0..len {
-                assert_eq!(out[i], ref_mul(a[i], b[i]), "len={len} i={i}");
-            }
-        }
-        // Stress: many random length-13 batches.
-        for _ in 0..1_000 {
-            let a: Vec<F128> = (0..13).map(|_| rng.next_f128()).collect();
-            let b: Vec<F128> = (0..13).map(|_| rng.next_f128()).collect();
-            let mut out = vec![F128::ZERO; 13];
-            F128::mul_batch(&a, &b, &mut out);
-            for i in 0..13 {
-                assert_eq!(out[i], ref_mul(a[i], b[i]));
-            }
-        }
     }
 
     #[test]
